@@ -1,6 +1,10 @@
 import { getRpcHealth } from '@/blockchain/soroban.js';
 import { pingRedis } from '@/config/redis.js';
 import { supabase } from '@/config/supabase.js';
+import {
+  getContractVersionHealth,
+  type ContractVersionHealth,
+} from '@/config/contractRegistry.js';
 import { type Request, type Response, Router } from 'express';
 
 const router = Router();
@@ -92,15 +96,67 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     blockchain: toHealthStatus(blockchainResult),
   };
 
+  // Contract version health is derived from the validated registry (no network calls).
+  let contracts: ContractVersionHealth;
+  try {
+    contracts = getContractVersionHealth();
+  } catch {
+    contracts = {
+      status: 'error',
+      network: null,
+      contractId: null,
+      wasmHash: null,
+      abiVersion: null,
+      compatible: false,
+      issues: ['contract registry unavailable'],
+    };
+  }
+
   // Database is always required; others are optional
   const notReady = checks.database === 'error' ||
-    (process.env.REDIS_URL && checks.redis === 'error');
+    (process.env.REDIS_URL && checks.redis === 'error') ||
+    contracts.status === 'error';
 
   res.status(notReady ? 503 : 200).json({
     status: notReady ? 'not_ready' : 'ready',
     service: 'Rentars API 🚀',
     timestamp: new Date().toISOString(),
     checks,
+    contracts,
+  });
+});
+
+/**
+ * GET /health/contracts — non-sensitive contract version health.
+ *
+ * Exposes the deployed network, contract ID, WASM hash, ABI version and
+ * compatibility status from the validated contract registry. Contains no
+ * secrets and performs no network calls, so it is safe for operators and
+ * monitoring dashboards.
+ *
+ * Returns HTTP 503 when the configured contract is unknown or incompatible.
+ */
+router.get('/health/contracts', (_req: Request, res: Response) => {
+  let contracts: ContractVersionHealth;
+  try {
+    contracts = getContractVersionHealth();
+  } catch {
+    contracts = {
+      status: 'error',
+      network: null,
+      contractId: null,
+      wasmHash: null,
+      abiVersion: null,
+      compatible: false,
+      issues: ['contract registry unavailable'],
+    };
+  }
+
+  res.status(contracts.status === 'error' ? 503 : 200).json({
+    status: contracts.status,
+    service: 'Rentars API 🚀',
+    timestamp: new Date().toISOString(),
+    contracts,
   });
 });
 

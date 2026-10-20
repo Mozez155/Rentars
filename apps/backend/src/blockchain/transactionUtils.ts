@@ -13,7 +13,7 @@ import {
   STELLAR_SOURCE_ACCOUNT,
 } from './config.js';
 import { getSorobanServer } from './soroban.js';
-import { BlockchainError } from './errors.js';
+import { BlockchainError, NetworkMismatchError } from './errors.js';
 
 const FEE_ESTIMATION_PERCENTILE = 90;
 const MAX_FEE_CEILING_MULTIPLIER = 10;
@@ -45,8 +45,28 @@ export async function estimateTransactionFee(): Promise<string> {
 }
 
 /**
+ * Assert that a transaction was built for the configured network.
+ * Throws NetworkMismatchError when the transaction's network passphrase
+ * does not match the centrally configured network.
+ */
+export function assertTransactionNetwork(
+  tx: Transaction,
+  expectedPassphrase: string = NETWORK_PASSPHRASE,
+): void {
+  const actual = tx.networkPassphrase;
+  if (actual !== expectedPassphrase) {
+    throw new NetworkMismatchError(
+      `Transaction network mismatch: expected "${expectedPassphrase}" but transaction targets "${actual ?? 'unknown'}". ` +
+        'Refusing to sign or broadcast on the wrong network.',
+      { expected: expectedPassphrase, actual: actual ?? null },
+    );
+  }
+}
+
+/**
  * Build an unsigned transaction from a list of operations.
  * Uses dynamically estimated fee when available.
+ * The transaction is tagged with the configured network passphrase.
  */
 export async function buildTransaction(
   operations: xdr.Operation[],
@@ -70,13 +90,17 @@ export async function buildTransaction(
     builder = builder.addOperation(op);
   }
 
-  return builder.setTimeout(30).build();
+  const tx = builder.setTimeout(30).build();
+  assertTransactionNetwork(tx);
+  return tx;
 }
 
 /**
  * Sign a transaction with the given keypair (mutates and returns the transaction).
+ * Rejects signing when the transaction targets a different network than configured.
  */
 export function signTransaction(tx: Transaction, keypair: Keypair): Transaction {
+  assertTransactionNetwork(tx);
   tx.sign(keypair);
   return tx;
 }
@@ -102,6 +126,7 @@ export async function buildPrepareAndSign(server: rpc.Server, operations: xdr.Op
   await simulateOrThrow(server, tx);
 
   const prepared = await server.prepareTransaction(tx);
+  assertTransactionNetwork(prepared as Transaction);
   (prepared as Transaction).sign(adminKeypair);
   return prepared as Transaction;
 }
@@ -146,8 +171,60 @@ export interface TransactionStatusResult {
 }
 
 /**
+ * Persisted record of a broadcast transaction, tagged with its network.
+ */
+export interface SubmittedTransactionRecord {
+  txHash: string;
+  networkPassphrase: string;
+  submittedAt: string;
+}
+
+/**
+ * Validate that a transaction is safe to broadcast on the configured network
+ * and return a record tagged with its hash and network for persistence.
+ * Throws NetworkMismatchError before broadcast when the network does not match.
+ */
+export function prepareSubmission(
+  tx: Transaction,
+  expectedPassphrase: string = NETWORK_PASSPHRASE,
+): SubmittedTransactionRecord {
+  assertTransactionNetwork(tx, expectedPassphrase);
+  return {
+    txHash: tx.hash().toString('hex'),
+    networkPassphrase: expectedPassphrase,
+    submittedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Classify a raw RPC transaction response into a confirmation status.
+ * Distinguishes not-found (still pending inclusion), pending, failed, and confirmed.
+ */
+export function classifyTransactionResponse(
+  response: rpc.Api.GetTransactionResponse,
+): TransactionStatusResult {
+  if (response.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
+    return { status: 'not_found', response };
+  }
+
+  if (response.status === rpc.Api.GetTransactionStatus.FAILED) {
+    return { status: 'failed', response };
+  }
+
+  if (response.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+    return { status: 'success', response };
+  }
+
+  return { status: 'pending', response };
+}
+
+/**
  * Poll transaction status from the Stellar RPC.
  * Returns the transaction status and response if confirmed.
+ *
+ * Transport errors are reported as `pending` (not `failed`) so that callers
+ * can hand unresolved transactions to reconciliation rather than falsely
+ * implying a final failure.
  *
  * @param server - Soroban RPC server instance
  * @param tyHash - Transaction hash to poll
@@ -159,23 +236,10 @@ export async function getTransactionStatus(
 ): Promise<TransactionStatusResult> {
   try {
     const response = await server.getTransaction(tyHash);
-
-    if (response.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
-      return { status: 'pending' };
-    }
-
-    if (response.status === rpc.Api.GetTransactionStatus.FAILED) {
-      return { status: 'failed', response };
-    }
-
-    if (response.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      return { status: 'success', response };
-    }
-
-    return { status: 'pending' };
+    return classifyTransactionResponse(response);
   } catch (err) {
     console.error(`[transaction-status] Failed to get status for ${tyHash}: ${(err as Error).message}`);
-    return { status: 'failed' };
+    return { status: 'pending' };
   }
 }
 

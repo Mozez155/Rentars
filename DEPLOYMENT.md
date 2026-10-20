@@ -33,8 +33,10 @@ Before you deploy, confirm each item below:
 - [ ] Stellar accounts created and funded for deployment
 - [ ] Contract artifacts built in `apps/contracts/target/wasm32-unknown-unknown/release`
 - [ ] Contract IDs recorded and stored securely
+- [ ] Contract version registry updated with contract IDs, WASM hashes, and ABI versions for the target network
 - [ ] Backend health endpoint (`/health`) returns success
 - [ ] Frontend can connect to backend and Stellar RPC endpoints
+- [ ] Wallet network, backend `STELLAR_NETWORK`, and frontend `NEXT_PUBLIC_STELLAR_NETWORK` all match
 - [ ] Secrets are stored in an encrypted secrets manager, not in Git
 
 ### 2.1 Preflight checks
@@ -60,6 +62,15 @@ redis-cli -u "$REDIS_URL" ping
 
 # 5. Contract artifacts exist for the target network
 ls apps/contracts/target/wasm32-unknown-unknown/release/*.wasm
+
+# 5a. Configured contract IDs are known to the version registry for this network
+#     (fails on unknown contract ID, ABI mismatch, or missing registry entry)
+cd apps/backend && bun run contracts:validate
+cd ..
+
+# 5b. Network configuration is explicit and consistent (no silent testnet default)
+grep -q '^STELLAR_NETWORK=' apps/backend/.env || echo "MISSING: STELLAR_NETWORK"
+grep -q '^NEXT_PUBLIC_STELLAR_NETWORK=' apps/web/.env.local || echo "MISSING: NEXT_PUBLIC_STELLAR_NETWORK"
 
 # 6. Dependency trees install cleanly from lockfiles
 cd apps/backend && bun install --frozen-lockfile
@@ -97,6 +108,8 @@ curl -sfI "$FRONTEND_URL" | head -1
 | Contract tests | all pass | any undocumented change |
 | `GET /properties` | 200 + JSON array | 5xx or malformed body |
 | `GET /bookings` unauthenticated | 401 | unexpected 200 |
+| `GET /version/contracts` | registry entries match deployed IDs/hashes | unknown or mismatched contract |
+| `GET /health/deep` `stellar.network` | equals configured `STELLAR_NETWORK` | network mismatch |
 
 ---
 
@@ -176,6 +189,85 @@ STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 
 If the frontend needs any contract metadata or network endpoints, ensure it is configured through the backend API or Vercel environment values.
 
+### 3.6 Contract version registry
+
+Every deployed contract must be recorded in the version registry
+(`apps/contracts/versions.json`, generated at build/deploy time and validated at
+backend startup). Each entry records:
+
+| Field | Description |
+|---|---|
+| `contract_id` | Deployed Soroban contract ID |
+| `network` | `testnet` or `mainnet` |
+| `wasm_hash` | SHA-256 hash of the deployed WASM artifact |
+| `abi_version` | ABI version the contract exposes |
+| `init_dependencies` | Contract IDs that must be initialized first (e.g. booking → property-listing) |
+| `app_releases` | Application release versions known to be compatible with this entry |
+
+Generate the registry entry during deployment (the deploy script writes it
+automatically; do not hand-edit hashes):
+
+```bash
+cd apps/contracts
+bun run versions:record --network testnet \
+  --contract booking --id "$BOOKING_CONTRACT_ID" \
+  --wasm target/wasm32-unknown-unknown/release/booking.wasm \
+  --abi-version 1 \
+  --init-dependency "$PROPERTY_LISTING_CONTRACT_ID"
+```
+
+The backend validates configured contract IDs against the registry at startup
+and refuses to serve critical traffic if an ID is unknown, its ABI version is
+incompatible with the running application, or its `init_dependencies` are not
+satisfied. Non-sensitive version health data is exposed at
+`GET /version/contracts` (contract ID, network, WASM hash, ABI version,
+compatibility status — never secrets).
+
+### 3.7 Network validation rules
+
+Freighter signing, backend submission, contract IDs, and RPC configuration must
+all refer to the same Stellar network. The backend enforces this independently
+of the frontend:
+
+- **Connection:** the wallet's reported network must equal `STELLAR_NETWORK`.
+- **Quote:** quotes are tagged with the active network; a quote created on one
+  network cannot be used on another.
+- **Signing:** the frontend displays the active network before requesting
+  authorization and refuses to sign if the wallet network differs.
+- **Submission:** intents carry their network tag; the backend rejects any
+  intent whose tag does not match `STELLAR_NETWORK` before broadcast.
+- **Reconciliation:** reconciliation jobs only consider transactions on the
+  configured network and RPC URL.
+
+A mismatch must produce an actionable error (e.g. "Wallet is on mainnet but
+Rentars is configured for testnet — switch networks in Freighter") and must
+prevent signing or submission.
+
+### 3.8 Production network policy
+
+- `STELLAR_NETWORK` and `NEXT_PUBLIC_STELLAR_NETWORK` are **required** in
+  production. The backend and frontend fail fast at startup if they are unset;
+  there is no silent default to testnet.
+- Production (`NODE_ENV=production`) must not use testnet RPC or Horizon URLs;
+  startup validation rejects `*-testnet.stellar.org` endpoints in production.
+- Mainnet contract IDs must be present in the registry for `network: mainnet`
+  before the backend will accept traffic.
+
+### 3.9 Staging-first upgrade sequencing
+
+Contract upgrades must be proven on staging before production rollout:
+
+1. Deploy the new contract version to testnet/staging and record its registry
+   entry (`wasm_hash`, `abi_version`, `init_dependencies`).
+2. Deploy the application release to staging and run `bun run contracts:validate`
+   plus the post-deployment verification in §2.2.
+3. Confirm the staging upgrade is compatible (ABI version, cross-contract calls,
+   initialization) and record the result.
+4. Only then deploy the same contract version and application release to
+   mainnet, recording the mainnet registry entry.
+5. If a compatibility check fails, roll back the staging application release and
+   do not promote.
+
 ---
 
 ## 4. Backend Deployment
@@ -191,8 +283,8 @@ Use `apps/backend/.env.example` as a template and populate the following values:
 - `JWT_SECRET` — secure JWT signing secret
 - `CORS_ORIGIN` — frontend origin URL
 - `REDIS_URL` — Redis connection string
-- `STELLAR_NETWORK` — `testnet` or `mainnet`
-- `STELLAR_RPC_URL` — Soroban RPC URL
+- `STELLAR_NETWORK` — `testnet` or `mainnet` (required in production; no default)
+- `STELLAR_RPC_URL` — Soroban RPC URL (must match `STELLAR_NETWORK`)
 - `PROPERTY_LISTING_CONTRACT_ID` — on-chain contract ID
 - `BOOKING_CONTRACT_ID` — on-chain contract ID
 - `REVIEW_CONTRACT_ID` — on-chain contract ID
@@ -272,7 +364,7 @@ In Vercel:
 Configure the following Vercel environment variables for production or preview:
 
 - `NEXT_PUBLIC_API_URL` — backend API endpoint (e.g. `https://api.rentars.app`)
-- `NEXT_PUBLIC_STELLAR_NETWORK` — `testnet` or `mainnet`
+- `NEXT_PUBLIC_STELLAR_NETWORK` — `testnet` or `mainnet` (required in production; must match backend `STELLAR_NETWORK`)
 - `NEXT_PUBLIC_HORIZON_URL` — `https://horizon-testnet.stellar.org` or `https://horizon.stellar.org`
 - `NEXT_PUBLIC_SOROBAN_RPC_URL` — `https://soroban-testnet.stellar.org` or `https://soroban-mainnet.stellar.org`
 - `NEXT_PUBLIC_PASSKEY_RP_ID` — WebAuthn relying party ID for your domain
@@ -287,8 +379,10 @@ After deployment, verify:
 
 - The site loads without console errors
 - The API requests resolve correctly to the backend
-- Stellar network selection uses the expected network
+- Stellar network selection uses the expected network and is displayed before authorization
 - Wallet integration can connect to Freighter or other supported Stellar wallet
+- A wallet on the wrong network is blocked from signing with an actionable message
+- `GET /version/contracts` reports the deployed contract IDs, WASM hashes, and ABI versions
 
 ---
 
@@ -300,6 +394,10 @@ Before switching from testnet to mainnet, complete this checklist:
 - [ ] Schedule a third-party contract audit if possible
 - [ ] Confirm admin keys are stored offline and rotated securely
 - [ ] Confirm all production environment variables use `mainnet` values
+- [ ] Confirm `STELLAR_NETWORK` and `NEXT_PUBLIC_STELLAR_NETWORK` are explicitly set to `mainnet` (production must not default to testnet)
+- [ ] Confirm no production RPC/Horizon URL points at `*-testnet.stellar.org`
+- [ ] Confirm mainnet contract IDs, WASM hashes, and ABI versions are recorded in the version registry
+- [ ] Confirm the staging upgrade of the same contract and app release passed compatibility checks
 - [ ] Update `STELLAR_NETWORK` to `mainnet`
 - [ ] Update `STELLAR_RPC_URL` to `https://soroban-mainnet.stellar.org`
 - [ ] Update `NEXT_PUBLIC_HORIZON_URL` to `https://horizon.stellar.org`
@@ -347,6 +445,7 @@ Perform the following before mainnet launch:
 Smart contracts on Stellar are immutable. If a contract bug is discovered in production:
 
 - Deploy a new contract version with a patched ABI
+- Record the new version in the registry (`wasm_hash`, `abi_version`, `init_dependencies`) and prove compatibility on staging first
 - Update `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID` in the backend
 - Verify cross-contract calls and initialization again
 
@@ -663,8 +762,11 @@ curl https://api.rentars.app/version | jq '.'
 psql -h $DB_HOST -U $DB_USER -d rentars \
   -c "SELECT migration_version FROM schema_versions ORDER BY applied_at DESC LIMIT 1;"
 
-# Check active contract IDs
-curl https://api.rentars.app/contracts | jq '.contracts | {booking, property_listing, review}'
+# Check active contract IDs, WASM hashes, and ABI versions
+curl https://api.rentars.app/version/contracts | jq '.contracts[] | {name, network, contract_id, wasm_hash, abi_version, compatible}'
+
+# Check the active network reported by the backend
+curl https://api.rentars.app/health/deep | jq '.dependencies.stellar.network'
 
 # Check cache version
 redis-cli INFO replication | grep role
@@ -798,10 +900,14 @@ To confirm deployments are production-ready, verify:
 4. ✅ Schema compatibility rules documented for add/remove/rename operations
 5. ✅ Cache invalidation procedure defined for rollback scenarios
 6. ✅ Rollback runbook includes backend, database, and contract rollback steps
-7. ✅ All operators can identify: current version, active migration, contract IDs, and cache version
+7. ✅ All operators can identify: current version, active migration, contract IDs, WASM hashes, ABI versions, and cache version
 8. ✅ Staging rollback drill completed and documented in CI/CD pipeline
 9. ✅ Health gates monitoring configured in observability platform
 10. ✅ Rollback approval process requires 2 approvers for production
 11. ✅ No commands expose signing secrets in logs or CLI arguments
+12. ✅ Contract version registry validated at startup; unknown or incompatible contract configuration blocks critical traffic
+13. ✅ Wallet/backend network mismatches are rejected before signing or submission with an actionable message
+14. ✅ Production cannot silently default to testnet; missing network configuration fails fast
+15. ✅ Staging upgrade proves contract/ABI compatibility before production rollout
 
 If all checks are satisfied, deployment automation is production-ready.

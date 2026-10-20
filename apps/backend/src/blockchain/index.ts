@@ -34,6 +34,21 @@ export {
 export { getSorobanServer, submitAndWait, buildFeeBump } from './soroban.js';
 
 export {
+  getNetworkConfig,
+  getActiveNetwork,
+  assertNetworkMatch,
+  assertProductionNetwork,
+  networkConfig,
+} from './networkConfig.js';
+
+export {
+  getContractRegistry,
+  getContractMetadata,
+  validateContractConfiguration,
+  getVersionHealth,
+} from './contractRegistry.js';
+
+export {
   buildTransaction,
   signTransaction,
   buildPrepareAndSign,
@@ -51,6 +66,8 @@ export {
   TransactionError,
   AvailabilityError,
   EscrowError,
+  NetworkMismatchError,
+  ContractConfigurationError,
 } from './errors.js';
 
 export type {
@@ -79,3 +96,14 @@ export type {
 } from './trustlessWork.js';
 
 export type { OnChainPropertyData } from './propertyListingContract.js';
+
+export type {
+  NetworkConfig,
+  StellarNetwork,
+} from './networkConfig.js';
+
+export type {
+  ContractMetadata,
+  ContractRegistry,
+  ContractVersionHealth,
+} from './contractRegistry.js';

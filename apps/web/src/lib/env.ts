@@ -20,20 +20,36 @@ const envSchema = z.object({
       'NEXT_PUBLIC_API_URL must use http:// or https://'
     ),
 
+  // Network must be explicitly configured. There is no default: an unset or
+  // empty value fails validation so production can never silently fall back
+  // to testnet.
   NEXT_PUBLIC_STELLAR_NETWORK: z
-    .enum(['testnet', 'mainnet', 'futurenet'])
-    .refine(
-      (network) => {
-        if (typeof window !== 'undefined') {
-          const isProduction = window.location.hostname !== 'localhost' && !window.location.hostname.includes('staging');
-          if (isProduction && network !== 'mainnet') {
-            console.warn('⚠️  Production environment detected but NEXT_PUBLIC_STELLAR_NETWORK is not mainnet');
-          }
-        }
-        return true;
-      },
-      { message: 'Network configuration warning' }
-    ),
+    .enum(['testnet', 'mainnet', 'futurenet'], {
+      errorMap: () => ({
+        message:
+          'NEXT_PUBLIC_STELLAR_NETWORK must be explicitly set to one of: testnet, mainnet, futurenet',
+      }),
+    })
+    .refine((network) => network.trim().length > 0, {
+      message: 'NEXT_PUBLIC_STELLAR_NETWORK must not be empty',
+    }),
+
+  // Contract ID deployed on the selected network (required).
+  NEXT_PUBLIC_CONTRACT_ID: z
+    .string()
+    .min(1, 'NEXT_PUBLIC_CONTRACT_ID is required')
+    .regex(/^C[A-Z2-7]{55}$/, 'NEXT_PUBLIC_CONTRACT_ID must be a valid Stellar contract ID (C...)'),
+
+  // ABI version the frontend was built against (required).
+  NEXT_PUBLIC_CONTRACT_ABI_VERSION: z
+    .string()
+    .min(1, 'NEXT_PUBLIC_CONTRACT_ABI_VERSION is required'),
+
+  // WASM hash of the deployed contract (required for version health checks).
+  NEXT_PUBLIC_CONTRACT_WASM_HASH: z
+    .string()
+    .min(1, 'NEXT_PUBLIC_CONTRACT_WASM_HASH is required')
+    .regex(/^[0-9a-f]{64}$/i, 'NEXT_PUBLIC_CONTRACT_WASM_HASH must be a 64-character hex string'),
 
   NEXT_PUBLIC_HORIZON_URL: z
     .string()
@@ -64,23 +80,61 @@ const envSchema = z.object({
     .url('NEXT_PUBLIC_PASSKEY_ORIGIN must be a valid URL'),
 });
 
-// Cross-field validation: ensure network matches URLs
-const envWithCrossValidation = envSchema.refine(
-  (data) => {
-    const isTestnet = data.NEXT_PUBLIC_STELLAR_NETWORK === 'testnet';
-    const horizonIsTestnet = data.NEXT_PUBLIC_HORIZON_URL.includes('testnet');
-    const sorobanIsTestnet = data.NEXT_PUBLIC_SOROBAN_RPC_URL.includes('testnet');
+/**
+ * Detect whether a URL points at a testnet/futurenet endpoint.
+ * Returns the detected network name, or 'mainnet' when no testnet marker
+ * is present.
+ */
+function detectNetworkFromUrl(url: string): 'testnet' | 'futurenet' | 'mainnet' {
+  const lower = url.toLowerCase();
+  if (lower.includes('futurenet')) return 'futurenet';
+  if (lower.includes('testnet')) return 'testnet';
+  return 'mainnet';
+}
 
-    if (isTestnet) {
-      return horizonIsTestnet && sorobanIsTestnet;
-    } else {
-      return !horizonIsTestnet && !sorobanIsTestnet;
-    }
-  },
-  {
-    message: 'Network configuration mismatch: NEXT_PUBLIC_STELLAR_NETWORK must match the URLs (testnet/mainnet)',
+/**
+ * Determine whether the current runtime is a production deployment.
+ * Server-side: NODE_ENV === 'production'.
+ * Client-side: non-local, non-staging hostname.
+ */
+export function isProductionRuntime(): boolean {
+  if (typeof window === 'undefined') {
+    return process.env.NODE_ENV === 'production';
   }
-);
+  const host = window.location.hostname;
+  return host !== 'localhost' && host !== '127.0.0.1' && !host.includes('staging');
+}
+
+// Cross-field validation: ensure network matches URLs and production safety.
+const envWithCrossValidation = envSchema
+  .refine(
+    (data) => {
+      const network = data.NEXT_PUBLIC_STELLAR_NETWORK;
+      const horizonNetwork = detectNetworkFromUrl(data.NEXT_PUBLIC_HORIZON_URL);
+      const sorobanNetwork = detectNetworkFromUrl(data.NEXT_PUBLIC_SOROBAN_RPC_URL);
+
+      return horizonNetwork === network && sorobanNetwork === network;
+    },
+    {
+      message:
+        'Network configuration mismatch: NEXT_PUBLIC_STELLAR_NETWORK must match NEXT_PUBLIC_HORIZON_URL and NEXT_PUBLIC_SOROBAN_RPC_URL',
+      path: ['NEXT_PUBLIC_STELLAR_NETWORK'],
+    }
+  )
+  .refine(
+    (data) => {
+      // Production must never resolve to a non-mainnet network.
+      if (isProductionRuntime()) {
+        return data.NEXT_PUBLIC_STELLAR_NETWORK === 'mainnet';
+      }
+      return true;
+    },
+    {
+      message:
+        'Production deployment must use NEXT_PUBLIC_STELLAR_NETWORK=mainnet; refusing to run against testnet/futurenet',
+      path: ['NEXT_PUBLIC_STELLAR_NETWORK'],
+    }
+  );
 
 export type ClientEnvironment = z.infer<typeof envSchema>;
 
@@ -93,6 +147,9 @@ function validateEnv(): ClientEnvironment {
     NEXT_PUBLIC_PASSKEY_RP_ID: process.env.NEXT_PUBLIC_PASSKEY_RP_ID,
     NEXT_PUBLIC_PASSKEY_RP_NAME: process.env.NEXT_PUBLIC_PASSKEY_RP_NAME,
     NEXT_PUBLIC_PASSKEY_ORIGIN: process.env.NEXT_PUBLIC_PASSKEY_ORIGIN,
+    NEXT_PUBLIC_CONTRACT_ID: process.env.NEXT_PUBLIC_CONTRACT_ID,
+    NEXT_PUBLIC_CONTRACT_ABI_VERSION: process.env.NEXT_PUBLIC_CONTRACT_ABI_VERSION,
+    NEXT_PUBLIC_CONTRACT_WASM_HASH: process.env.NEXT_PUBLIC_CONTRACT_WASM_HASH,
   };
 
   const result = envWithCrossValidation.safeParse(envVars);
@@ -127,6 +184,48 @@ function validateEnv(): ClientEnvironment {
 export const env = validateEnv();
 
 /**
+ * The active Stellar network the app is configured for.
+ * Exposed so the UI can display it before user authorization.
+ */
+export const activeNetwork: ClientEnvironment['NEXT_PUBLIC_STELLAR_NETWORK'] =
+  env.NEXT_PUBLIC_STELLAR_NETWORK;
+
+/**
+ * Non-sensitive contract version metadata for the active network.
+ * Used by the UI to display the deployed contract version and by startup
+ * health checks to detect unknown/incompatible configuration.
+ */
+export interface ContractMetadata {
+  network: ClientEnvironment['NEXT_PUBLIC_STELLAR_NETWORK'];
+  contractId: string;
+  abiVersion: string;
+  wasmHash: string;
+}
+
+export const contractMetadata: Readonly<ContractMetadata> = Object.freeze({
+  network: env.NEXT_PUBLIC_STELLAR_NETWORK,
+  contractId: env.NEXT_PUBLIC_CONTRACT_ID,
+  abiVersion: env.NEXT_PUBLIC_CONTRACT_ABI_VERSION,
+  wasmHash: env.NEXT_PUBLIC_CONTRACT_WASM_HASH,
+});
+
+/**
+ * Human-readable label for the active network, suitable for display in the UI.
+ */
+export function getActiveNetworkLabel(): string {
+  switch (env.NEXT_PUBLIC_STELLAR_NETWORK) {
+    case 'mainnet':
+      return 'Mainnet';
+    case 'testnet':
+      return 'Testnet';
+    case 'futurenet':
+      return 'Futurenet';
+    default:
+      return env.NEXT_PUBLIC_STELLAR_NETWORK;
+  }
+}
+
+/**
  * Diagnostic command that reports missing/invalid keys without printing values.
  * Run with: node -e "require('./dist/lib/env').diagnose()"
  */
@@ -139,6 +238,9 @@ export function diagnose(): void {
     'NEXT_PUBLIC_PASSKEY_RP_ID',
     'NEXT_PUBLIC_PASSKEY_RP_NAME',
     'NEXT_PUBLIC_PASSKEY_ORIGIN',
+    'NEXT_PUBLIC_CONTRACT_ID',
+    'NEXT_PUBLIC_CONTRACT_ABI_VERSION',
+    'NEXT_PUBLIC_CONTRACT_WASM_HASH',
   ];
 
   console.log('\n📋 Environment Configuration Diagnostic\n');

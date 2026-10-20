@@ -58,14 +58,31 @@ const envSchema = z.object({
   REDIS_URL: z.string().url().optional(),
 
   // ── Stellar / Soroban ─────────────────────────────────────────────────────
+  // Network selection is explicit. In production the default is removed by the
+  // superRefine below so a missing value can never silently resolve to testnet.
   STELLAR_NETWORK: z
     .enum(['testnet', 'mainnet'])
     .default('testnet'),
 
   STELLAR_RPC_URL: z.string().url().optional(),
 
+  // Network passphrase used to sign/verify transactions. When unset it is
+  // derived from STELLAR_NETWORK by the centralized network config.
+  STELLAR_NETWORK_PASSPHRASE: z.string().optional(),
+
   PROPERTY_LISTING_CONTRACT_ID: z.string().optional(),
   BOOKING_CONTRACT_ID: z.string().optional(),
+
+  // ── Contract version registry ─────────────────────────────────────────────
+  // ABI version deployed alongside the contract IDs above.
+  CONTRACT_ABI_VERSION: z.string().optional(),
+  // WASM hash of the deployed contract (hex, 64 chars) for version health.
+  CONTRACT_WASM_HASH: z
+    .string()
+    .regex(/^[0-9a-fA-F]{64}$/, 'CONTRACT_WASM_HASH must be a 64-character hex string')
+    .optional(),
+  // Application release the deployed contracts are compatible with.
+  CONTRACT_COMPATIBLE_APP_VERSION: z.string().optional(),
 
   // ── Trustless Work (escrow) ────────────────────────────────────────────────
   TRUSTLESS_WORK_API_URL: z.string().url().optional(),
@@ -343,17 +360,74 @@ const envSchema = z.object({
       path: ['CORS_ORIGIN'],
       message: 'CORS_ORIGIN must be set explicitly in production',
     });
-    return;
+  } else {
+    for (const origin of value.CORS_ORIGIN) {
+      if (!origin.startsWith('https://')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['CORS_ORIGIN'],
+          message: `Production CORS origin must use https:// (got '${origin}')`,
+        });
+      }
+    }
   }
 
-  for (const origin of value.CORS_ORIGIN) {
-    if (!origin.startsWith('https://')) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['CORS_ORIGIN'],
-        message: `Production CORS origin must use https:// (got '${origin}')`,
-      });
-    }
+  // ── Stellar network must be explicit and non-testnet in production ────────
+  // A missing STELLAR_NETWORK would otherwise fall back to the schema default
+  // ('testnet'), silently routing production traffic to the wrong network.
+  if (!process.env.STELLAR_NETWORK?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['STELLAR_NETWORK'],
+      message: 'STELLAR_NETWORK must be set explicitly in production (testnet or mainnet)',
+    });
+  } else if (value.STELLAR_NETWORK === 'testnet') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['STELLAR_NETWORK'],
+      message: 'STELLAR_NETWORK must not be testnet in production',
+    });
+  }
+
+  // RPC endpoint must be explicit — no implicit public/testnet fallback.
+  if (!value.STELLAR_RPC_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['STELLAR_RPC_URL'],
+      message: 'STELLAR_RPC_URL must be set explicitly in production',
+    });
+  }
+
+  // Contract IDs must be explicit so we never run against unknown contracts.
+  if (!value.PROPERTY_LISTING_CONTRACT_ID?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['PROPERTY_LISTING_CONTRACT_ID'],
+      message: 'PROPERTY_LISTING_CONTRACT_ID must be set explicitly in production',
+    });
+  }
+  if (!value.BOOKING_CONTRACT_ID?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['BOOKING_CONTRACT_ID'],
+      message: 'BOOKING_CONTRACT_ID must be set explicitly in production',
+    });
+  }
+
+  // Contract version metadata is required to detect incompatible deployments.
+  if (!value.CONTRACT_ABI_VERSION?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CONTRACT_ABI_VERSION'],
+      message: 'CONTRACT_ABI_VERSION must be set explicitly in production',
+    });
+  }
+  if (!value.CONTRACT_WASM_HASH?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CONTRACT_WASM_HASH'],
+      message: 'CONTRACT_WASM_HASH must be set explicitly in production',
+    });
   }
 });
 
@@ -389,3 +463,20 @@ function validateEnv(): Environment {
 }
 
 export const env: Readonly<Environment> = validateEnv();
+
+// ── Centralized network config ────────────────────────────────────────────────
+// Re-export the single source of truth for Stellar network configuration and
+// validate it at startup so a wallet/backend network mismatch fails fast.
+export {
+  NETWORK_CONFIG,
+  resolveNetworkConfig,
+  validateNetworkConfig,
+  type NetworkConfig,
+} from '../blockchain/config.js';
+
+import { validateNetworkConfig } from '../blockchain/config.js';
+
+// Throws (and therefore aborts startup) when the resolved network config is
+// inconsistent with the validated environment — e.g. a testnet RPC URL in a
+// mainnet deployment, or a missing production configuration.
+validateNetworkConfig(env);

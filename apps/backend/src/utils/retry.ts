@@ -111,6 +111,113 @@ function normalizeOptions(options: RetryOptions): Required<RetryOptions> {
   };
 }
 
+// ─── Bounded polling for transaction confirmation (issue #054) ───────────────
+
+/**
+ * Classification of a single poll result for a Stellar transaction.
+ *
+ * - `not_found`  – the network has not seen the hash yet (may still be included)
+ * - `pending`    – seen but not yet in a ledger
+ * - `failed`     – definitively failed on-chain (e.g. txFAILED)
+ * - `confirmed`  – included in a ledger and successful
+ * - `unresolved` – polling deadline elapsed without a final outcome; the
+ *                  transaction must be handed to reconciliation.  This is NOT
+ *                  a final failure.
+ */
+export type PollStatus = 'not_found' | 'pending' | 'failed' | 'confirmed' | 'unresolved';
+
+export interface PollResult<T> {
+  status: PollStatus;
+  /** Number of poll attempts performed. */
+  attempts: number;
+  /** The last value returned by the probe, if any. */
+  value?: T;
+  /** True when the deadline elapsed before a final outcome was reached. */
+  timedOut: boolean;
+}
+
+export interface PollOptions<T> extends RetryOptions {
+  /** Hard deadline in milliseconds; polling stops once exceeded. */
+  deadlineMs?: number;
+  /** Optional abort signal to stop polling early. */
+  signal?: AbortSignal;
+  /** Optional callback invoked after each poll (useful for logging/metrics). */
+  onPoll?: (attempt: number, status: PollStatus) => void;
+  /**
+   * Optional predicate deciding whether a probe result is final.  Defaults to
+   * treating `confirmed` and `failed` as final.
+   */
+  isFinal?: (status: PollStatus) => boolean;
+}
+
+const FALLBACK_POLL_DEADLINE_MS = 60000;
+
+function isFinalStatus(status: PollStatus): boolean {
+  return status === 'confirmed' || status === 'failed';
+}
+
+/**
+ * Poll `probe` with bounded exponential backoff until it reports a final
+ * status (`confirmed` / `failed`), the deadline elapses, or the abort signal
+ * fires.
+ *
+ * A deadline expiry yields `status: 'unresolved'` with `timedOut: true` so the
+ * caller can hand the transaction to reconciliation instead of falsely
+ * recording a final failure (issue #054).
+ */
+export async function pollWithBackoff<T>(
+  probe: (attempt: number) => Promise<{ status: PollStatus; value?: T }>,
+  options: PollOptions<T> = {}
+): Promise<PollResult<T>> {
+  const config = normalizeOptions(options);
+  const deadlineMs =
+    options.deadlineMs !== undefined &&
+    Number.isFinite(options.deadlineMs) &&
+    options.deadlineMs >= 0
+      ? Math.floor(options.deadlineMs)
+      : FALLBACK_POLL_DEADLINE_MS;
+  const finalCheck = options.isFinal ?? isFinalStatus;
+
+  const startedAt = Date.now();
+  let attempt = 0;
+  let lastStatus: PollStatus = 'not_found';
+  let lastValue: T | undefined;
+
+  while (attempt < config.maxAttempts) {
+    if (options.signal?.aborted) {
+      return { status: 'unresolved', attempts: attempt, value: lastValue, timedOut: false };
+    }
+
+    attempt++;
+    try {
+      const result = await probe(attempt);
+      lastStatus = result.status;
+      lastValue = result.value;
+    } catch {
+      // A probe error is treated as "not yet known" rather than a failure.
+      lastStatus = 'pending';
+    }
+
+    options.onPoll?.(attempt, lastStatus);
+
+    if (finalCheck(lastStatus)) {
+      return { status: lastStatus, attempts: attempt, value: lastValue, timedOut: false };
+    }
+
+    const elapsed = Date.now() - startedAt;
+    if (elapsed >= deadlineMs) {
+      break;
+    }
+
+    const delay = calculateNextDelay(attempt - 1, config);
+    const remaining = deadlineMs - elapsed;
+    await sleep(Math.min(delay, remaining));
+  }
+
+  // Deadline elapsed (or attempts exhausted) without a final outcome.
+  return { status: 'unresolved', attempts: attempt, value: lastValue, timedOut: true };
+}
+
 export async function retryDependencyConnections(
   options: RetryOptions = {}
 ): Promise<void> {

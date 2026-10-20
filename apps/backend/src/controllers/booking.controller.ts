@@ -11,9 +11,72 @@ import type { BookingModification } from '@/services/booking.service.js';
 import type { BookingActor } from '@/services/bookingAuthorization.service.js';
 import { lookup, store, lockKey, completeKey, releaseKey, hashRequestBody } from '@/services/idempotency.service.js';
 import { fetchReceiptData, generateReceiptPdf } from '@/services/receipt.service.js';
+import {
+  getActiveNetwork,
+  resolveRequestNetwork,
+  networkMismatchMessage,
+  type StellarNetwork,
+} from '@/config/network.js';
 
 function calendarFeedSecret(): string {
   return env.CALENDAR_FEED_SECRET ?? env.JWT_SECRET;
+}
+
+/**
+ * Resolve the network a request claims to operate on and compare it against the
+ * backend's active network. Returns the active network on success, or writes an
+ * actionable 409 and returns undefined on mismatch.
+ *
+ * The backend independently rejects the wrong network here so a client that
+ * skips its own check can never broadcast against the wrong ledger.
+ */
+function requireMatchingNetwork(req: Request, res: Response): StellarNetwork | undefined {
+  const active = getActiveNetwork();
+  const requested = resolveRequestNetwork(req);
+
+  if (requested && requested !== active) {
+    res.status(409).json({
+      error: networkMismatchMessage(requested, active),
+      code: 'NETWORK_MISMATCH',
+      expected_network: active,
+      received_network: requested,
+    });
+    return undefined;
+  }
+
+  return active;
+}
+
+/**
+ * Ensure the wallet address that owns the operation matches the authenticated
+ * caller's active wallet. Prevents a pending operation from silently continuing
+ * under a different account after a wallet switch.
+ */
+function requireOperationOwner(
+  req: Request,
+  res: Response,
+  expectedOwner: string | undefined,
+): boolean {
+  const claimedOwner =
+    (typeof req.body?.wallet_address === 'string' && req.body.wallet_address.trim()) ||
+    (typeof req.headers['x-wallet-address'] === 'string' && req.headers['x-wallet-address'].trim()) ||
+    undefined;
+
+  if (!claimedOwner) return true;
+
+  if (expectedOwner && claimedOwner !== expectedOwner) {
+    res.status(409).json({
+      error:
+        'The wallet account that started this operation no longer matches the active account. ' +
+        'Reconnect the original wallet and retry, or start a new booking.',
+      code: 'WALLET_ACCOUNT_MISMATCH',
+      expected_owner: expectedOwner,
+      received_owner: claimedOwner,
+    });
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -219,6 +282,14 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
   const userId = authReq.user?.id ?? authReq.userId;
   const idempotencyKey = req.headers['idempotency-key'];
 
+  // ── Network validation ──────────────────────────────────────────────────────
+  // Reject a wallet/backend network mismatch before any booking intent is
+  // created or any payment is broadcast.
+  const network = requireMatchingNetwork(req, res);
+  if (!network) return;
+
+  if (!requireOperationOwner(req, res, userId)) return;
+
   // ── Idempotency check ───────────────────────────────────────────────────────
   if (idempotencyKey) {
     if (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '') {
@@ -277,7 +348,7 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
       // We claimed the key — proceed and complete or release on failure.
       const claimedId = (lockData as { claimed: true; id: string }).id;
 
-      const result = await bookingService.createBooking(req.body);
+      const result = await bookingService.createBooking({ ...req.body, network });
 
       if (!result.success) {
         // Release the processing lock so the caller can retry.
@@ -301,7 +372,7 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
   }
 
   // ── Fallback: no idempotency key provided ───────────────────────────────────
-  const result = await bookingService.createBooking(req.body);
+  const result = await bookingService.createBooking({ ...req.body, network });
 
   if (!result.success) {
     const status = result.statusCode ?? (result.conflict ? 409 : 400);
@@ -326,7 +397,14 @@ export async function cancelBooking(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  const result = await bookingService.cancelBooking(req.params.id, authUser.id, new Date(), authUser.role);
+  // Cancellation settles escrow on-chain; reject a network mismatch before
+  // any refund transaction is signed or broadcast.
+  const network = requireMatchingNetwork(req, res);
+  if (!network) return;
+
+  if (!requireOperationOwner(req, res, authUser.id)) return;
+
+  const result = await bookingService.cancelBooking(req.params.id, authUser.id, new Date(), authUser.role, network);
 
   if (!result.success) {
     const statusCode =
@@ -355,7 +433,14 @@ export async function confirmBooking(req: Request, res: Response): Promise<void>
     return;
   }
 
-  const result = await bookingService.confirmBooking(req.params.id, authUser.id, authUser.role);
+  // Signing/submission boundary: the network and operation owner must still
+  // match before we accept a signed transaction hash.
+  const network = requireMatchingNetwork(req, res);
+  if (!network) return;
+
+  if (!requireOperationOwner(req, res, authUser.id)) return;
+
+  const result = await bookingService.confirmBooking(req.params.id, authUser.id, authUser.role, network);
 
   if (!result.success) {
     const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : 400);
@@ -364,6 +449,41 @@ export async function confirmBooking(req: Request, res: Response): Promise<void>
   }
 
   res.json(result.data);
+}
+
+/**
+ * GET /api/v1/bookings/:id/transaction
+ *
+ * Returns the persisted transaction state for a booking, distinguishing a
+ * broadcast-but-unconfirmed submission from a ledger-confirmed outcome. When
+ * polling has timed out the status is reported as `pending` (never a false
+ * final failure) so the client can defer to reconciliation.
+ */
+export async function getBookingTransaction(req: Request, res: Response): Promise<void> {
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.getBookingTransactionForActor(req.params.id, actor);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 404).json({ error: result.error });
+    return;
+  }
+
+  const tx = result.data;
+  const submitted = Boolean(tx?.tx_hash);
+  const confirmed = tx?.status === 'confirmed';
+
+  res.json({
+    ...tx,
+    submitted,
+    confirmed,
+    // Explicitly surface that an unresolved transaction is not a failure.
+    final: confirmed || tx?.status === 'failed',
+  });
 }
 
 /**
@@ -379,7 +499,12 @@ export async function completeBooking(req: Request, res: Response): Promise<void
     return;
   }
 
-  const result = await bookingService.completeBooking(req.params.id, authUser.id, authUser.role);
+  const network = requireMatchingNetwork(req, res);
+  if (!network) return;
+
+  if (!requireOperationOwner(req, res, authUser.id)) return;
+
+  const result = await bookingService.completeBooking(req.params.id, authUser.id, authUser.role, network);
 
   if (!result.success) {
     const statusCode = result.statusCode ??
@@ -717,9 +842,14 @@ export async function raiseDispute(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  const network = requireMatchingNetwork(req, res);
+  if (!network) return;
+
+  if (!requireOperationOwner(req, res, userId)) return;
+
   const { reason, details } = req.body as { reason: string; details?: string };
 
-  const result = await bookingService.raiseDispute(req.params.id, userId, reason, details);
+  const result = await bookingService.raiseDispute(req.params.id, userId, reason, details, network);
 
   if (!result.success) {
     res.status(400).json({ error: result.error });
@@ -742,6 +872,9 @@ export async function resolveDispute(req: Request, res: Response): Promise<void>
     return;
   }
 
+  const network = requireMatchingNetwork(req, res);
+  if (!network) return;
+
   const { resolution, admin_notes } = req.body as {
     resolution: 'refund_tenant' | 'release_to_host';
     admin_notes?: string;
@@ -752,7 +885,8 @@ export async function resolveDispute(req: Request, res: Response): Promise<void>
     authUser.id,
     resolution,
     admin_notes,
-    authUser.role
+    authUser.role,
+    network
   );
 
   if (!result.success) {

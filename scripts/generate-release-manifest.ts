@@ -104,6 +104,150 @@ for (const abi of abiFiles) {
   }
 }
 
+// ── Contract version registry ────────────────────────────────────────────────
+// Per-network record of contract ID, WASM hash, ABI version, initialization
+// dependencies and compatible application releases. Consumed by the backend
+// contract registry (apps/backend/src/contracts/registry.ts) to validate
+// configuration at startup and to expose non-sensitive version health data.
+//
+// Configuration sources (highest precedence first):
+//   1. CONTRACT_REGISTRY_FILE — path to a JSON registry document
+//   2. Per-network env vars (see contractEnv below)
+//   3. apps/contracts/contracts.registry.json (checked-in defaults)
+const CONTRACT_NAMES = ['property_listing', 'booking', 'review'] as const;
+type ContractName = (typeof CONTRACT_NAMES)[number];
+
+const ABI_VERSION = '1';
+const ABI_FILE_BY_CONTRACT: Record<ContractName, string> = {
+  property_listing: 'property_listing_abi.json',
+  booking: 'booking_abi.json',
+  review: 'review_abi.json',
+};
+
+// Initialization dependencies: contracts that must be deployed and initialized
+// before the dependent contract can be initialized.
+const INIT_DEPENDENCIES: Record<ContractName, ContractName[]> = {
+  property_listing: [],
+  booking: ['property_listing'],
+  review: ['property_listing', 'booking'],
+};
+
+const CONTRACT_ENV: Record<ContractName, { id: string; wasm: string }> = {
+  property_listing: {
+    id: 'PROPERTY_LISTING_CONTRACT_ID',
+    wasm: 'PROPERTY_LISTING_WASM_HASH',
+  },
+  booking: { id: 'BOOKING_CONTRACT_ID', wasm: 'BOOKING_WASM_HASH' },
+  review: { id: 'REVIEW_CONTRACT_ID', wasm: 'REVIEW_WASM_HASH' },
+};
+
+const NETWORKS = ['local', 'testnet', 'futurenet', 'mainnet'] as const;
+type Network = (typeof NETWORKS)[number];
+
+interface ContractRegistryEntry {
+  contract_id: string | null;
+  wasm_sha256: string | null;
+  abi_version: string;
+  abi_sha256: string | null;
+  init_dependencies: ContractName[];
+  compatible_releases: { backend: string; web: string; contracts: string };
+}
+
+type NetworkRegistry = Record<ContractName, ContractRegistryEntry>;
+
+const registryDefaultsPath = 'apps/contracts/contracts.registry.json';
+const registryFileOverride = process.env.CONTRACT_REGISTRY_FILE ?? null;
+const registrySourcePath = registryFileOverride ?? registryDefaultsPath;
+
+let registrySource: Record<string, unknown> = {};
+if (existsSync(resolve(ROOT, registrySourcePath))) {
+  registrySource = json(registrySourcePath);
+}
+
+const registryNetworks = (registrySource.networks ?? {}) as Record<string, unknown>;
+
+function buildNetworkRegistry(network: Network): NetworkRegistry {
+  const fromFile = (registryNetworks[network] ?? {}) as Record<string, unknown>;
+  const envSuffix = network.toUpperCase();
+  const entries = {} as NetworkRegistry;
+
+  for (const name of CONTRACT_NAMES) {
+    const fileEntry = (fromFile[name] ?? {}) as Record<string, unknown>;
+    const env = CONTRACT_ENV[name];
+    const contractId =
+      process.env[`${env.id}_${envSuffix}`] ??
+      (network === (process.env.STELLAR_NETWORK ?? 'local') ? process.env[env.id] : undefined) ??
+      (fileEntry.contract_id as string | undefined) ??
+      null;
+    const wasmHash =
+      process.env[`${env.wasm}_${envSuffix}`] ??
+      (network === (process.env.STELLAR_NETWORK ?? 'local') ? process.env[env.wasm] : undefined) ??
+      (fileEntry.wasm_sha256 as string | undefined) ??
+      null;
+    const abiFile = ABI_FILE_BY_CONTRACT[name];
+    const abiPath = `apps/contracts/${abiFile}`;
+
+    entries[name] = {
+      contract_id: contractId,
+      wasm_sha256: wasmHash,
+      abi_version: String(fileEntry.abi_version ?? ABI_VERSION),
+      abi_sha256: existsSync(resolve(ROOT, abiPath)) ? sha256(read(abiPath)) : null,
+      init_dependencies: [...INIT_DEPENDENCIES[name]],
+      compatible_releases: {
+        backend: String(
+          (fileEntry.compatible_releases as { backend?: string } | undefined)?.backend ??
+            backendPkg.version ??
+            version
+        ),
+        web: String(
+          (fileEntry.compatible_releases as { web?: string } | undefined)?.web ??
+            webPkg.version ??
+            version
+        ),
+        contracts: String(
+          (fileEntry.compatible_releases as { contracts?: string } | undefined)?.contracts ??
+            contractsVersion
+        ),
+      },
+    };
+  }
+
+  return entries;
+}
+
+const contractRegistry: Record<Network, NetworkRegistry> = {} as Record<Network, NetworkRegistry>;
+for (const network of NETWORKS) {
+  contractRegistry[network] = buildNetworkRegistry(network);
+}
+
+// Validate configured contract IDs at generation time so an unknown or
+// malformed configuration fails the build before it reaches critical traffic.
+const contractIdPattern = /^C[A-Z2-7]{55}$/;
+const registryWarnings: string[] = [];
+for (const network of NETWORKS) {
+  for (const name of CONTRACT_NAMES) {
+    const entry = contractRegistry[network][name];
+    if (entry.contract_id !== null && !contractIdPattern.test(entry.contract_id)) {
+      console.error(
+        `Invalid contract ID for ${name} on ${network}: "${entry.contract_id}" (expected C... StrKey)`
+      );
+      process.exit(1);
+    }
+    if (entry.wasm_sha256 !== null && !/^[0-9a-f]{64}$/.test(entry.wasm_sha256)) {
+      console.error(
+        `Invalid WASM hash for ${name} on ${network}: "${entry.wasm_sha256}" (expected 64 hex chars)`
+      );
+      process.exit(1);
+    }
+    if (entry.contract_id === null && network === 'mainnet') {
+      registryWarnings.push(`${name}: no contract ID configured for mainnet`);
+    }
+  }
+}
+for (const warning of registryWarnings) {
+  console.warn(`[contract-registry] ${warning}`);
+}
+
 // ── Git metadata ──────────────────────────────────────────────────────────────
 const commit = git('rev-parse HEAD');
 const tag = git('describe --tags --exact-match 2>/dev/null') || `v${version}`;
@@ -137,6 +281,12 @@ const manifest = {
   },
   contracts: {
     abi_sha256: abiHashes,
+    abi_version: ABI_VERSION,
+    registry_source: registrySourcePath,
+    registry_sha256: existsSync(resolve(ROOT, registrySourcePath))
+      ? sha256(read(registrySourcePath))
+      : null,
+    networks: contractRegistry,
   },
   rollback: {
     docs: 'docs/releases/rollback.md',

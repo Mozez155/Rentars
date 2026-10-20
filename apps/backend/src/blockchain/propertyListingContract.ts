@@ -26,7 +26,59 @@ import {
 import { getSorobanServer, simulateReadOnly, submitAndWait } from './soroban.js';
 import { buildPrepareAndSign } from './transactionUtils.js';
 import { ContractError } from './errors.js';
+import {
+  assertContractCompatible,
+  getContractEntry,
+  type ContractRegistryEntry,
+} from './contractRegistry.js';
 import type { ListingStatus } from './types.js';
+
+const PROPERTY_LISTING_CONTRACT_NAME = 'property_listing';
+const PROPERTY_LISTING_ABI_VERSION = '1.0.0';
+
+/**
+ * Resolve the registry entry for the property listing contract and fail fast
+ * when the configured contract ID, network, or ABI version is unknown or
+ * incompatible with this client.
+ *
+ * @param operation - Contract method name used for error reporting
+ * @returns Validated registry entry for the property listing contract
+ * @throws ContractError if the contract is not registered or is incompatible
+ */
+function resolvePropertyListingContract(operation: string): ContractRegistryEntry {
+  if (!PROPERTY_LISTING_CONTRACT_ID) {
+    throw new ContractError(
+      'PROPERTY_LISTING_CONTRACT_ID is not configured',
+      operation,
+    );
+  }
+
+  const entry = getContractEntry(PROPERTY_LISTING_CONTRACT_NAME);
+  if (!entry) {
+    throw new ContractError(
+      `Contract "${PROPERTY_LISTING_CONTRACT_NAME}" is not present in the contract registry`,
+      operation,
+    );
+  }
+
+  if (entry.contractId !== PROPERTY_LISTING_CONTRACT_ID) {
+    throw new ContractError(
+      `Contract registry ID for "${PROPERTY_LISTING_CONTRACT_NAME}" does not match the configured contract ID`,
+      operation,
+    );
+  }
+
+  if (entry.network !== NETWORK_PASSPHRASE) {
+    throw new ContractError(
+      `Contract registry network for "${PROPERTY_LISTING_CONTRACT_NAME}" does not match the configured network`,
+      operation,
+    );
+  }
+
+  assertContractCompatible(PROPERTY_LISTING_CONTRACT_NAME, PROPERTY_LISTING_ABI_VERSION, operation);
+
+  return entry;
+}
 
 export interface OnChainPropertyData {
   owner: string;
@@ -81,15 +133,10 @@ function computeSha256(data: string): string {
  * @throws ContractError if PROPERTY_LISTING_CONTRACT_ID is not configured or the call fails
  */
 export async function getPropertyListing(id: string): Promise<OnChainPropertyData> {
-  if (!PROPERTY_LISTING_CONTRACT_ID) {
-    throw new ContractError(
-      'PROPERTY_LISTING_CONTRACT_ID is not configured',
-      'get_property_listing',
-    );
-  }
+  const entry = resolvePropertyListingContract('get_property_listing');
 
   const server = getSorobanServer();
-  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+  const contract = new Contract(entry.contractId);
 
   const sourceAccount = await server.getAccount(STELLAR_SOURCE_ACCOUNT);
   const tx = new TransactionBuilder(sourceAccount, {
@@ -131,15 +178,10 @@ export async function createPropertyListing(
   dataHash: string,
   ownerAddress: string,
 ): Promise<void> {
-  if (!PROPERTY_LISTING_CONTRACT_ID) {
-    throw new ContractError(
-      'PROPERTY_LISTING_CONTRACT_ID is not configured',
-      'create_property_listing',
-    );
-  }
+  const entry = resolvePropertyListingContract('create_property_listing');
 
   const server = getSorobanServer();
-  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+  const contract = new Contract(entry.contractId);
 
   const op = contract.call(
     'create_property_listing',
@@ -165,15 +207,10 @@ export async function updatePropertyListing(
   dataHash: string,
   ownerAddress: string,
 ): Promise<void> {
-  if (!PROPERTY_LISTING_CONTRACT_ID) {
-    throw new ContractError(
-      'PROPERTY_LISTING_CONTRACT_ID is not configured',
-      'update_property_listing',
-    );
-  }
+  const entry = resolvePropertyListingContract('update_property_listing');
 
   const server = getSorobanServer();
-  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+  const contract = new Contract(entry.contractId);
 
   const op = contract.call(
     'update_property_listing',
@@ -199,15 +236,10 @@ export async function updatePropertyStatus(
   ownerAddress: string,
   status: ListingStatus,
 ): Promise<void> {
-  if (!PROPERTY_LISTING_CONTRACT_ID) {
-    throw new ContractError(
-      'PROPERTY_LISTING_CONTRACT_ID is not configured',
-      'update_property_status',
-    );
-  }
+  const entry = resolvePropertyListingContract('update_property_status');
 
   const server = getSorobanServer();
-  const contract = new Contract(PROPERTY_LISTING_CONTRACT_ID);
+  const contract = new Contract(entry.contractId);
 
   const op = contract.call(
     'update_property_status',

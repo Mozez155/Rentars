@@ -40,6 +40,24 @@ frontend_cpu           = 256
 frontend_memory        = 512
 frontend_desired_count = 1
 
+# ── Stellar network / contract version registry ───────────────────────────────
+# Explicit network selection: staging must never silently fall back to testnet
+# or mainnet.  The backend validates these values at startup and rejects any
+# wallet/RPC/contract combination that does not match.
+stellar_network         = "testnet"
+stellar_network_passphrase = "Test SDF Network ; September 2015"
+stellar_rpc_url         = "https://soroban-testnet.stellar.org"
+stellar_horizon_url     = "https://horizon-testnet.stellar.org"
+
+# Contract version registry (see docs/contract-versioning.md).
+# A staging upgrade must be proven here before the same hashes/ABI are
+# promoted to production.
+contract_id             = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASTG"
+contract_wasm_hash      = "0000000000000000000000000000000000000000000000000000000000000000"
+contract_abi_version    = "1.0.0"
+contract_init_dependencies = ["token:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATKN"]
+app_release             = "staging"
+
 # ── WAF ───────────────────────────────────────────────────────────────────────
 waf_rate_limit_per_5m = 500
 

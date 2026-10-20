@@ -26,6 +26,16 @@ import type {
   FundEscrowParams,
   ResolveDisputeParams,
 } from './types.js';
+import {
+  assertNetworkMatch,
+  getNetworkConfig,
+  type StellarNetwork,
+} from './network.js';
+import {
+  pollTransaction,
+  type PollOutcome,
+  type TransactionRecord,
+} from './transactionTracker.js';
 
 // ─── ABI metadata (sourced from booking_abi.json) ────────────────────────────
 const ABI_VERSION = '0.1.0';
@@ -37,15 +47,85 @@ export class BookingClient {
   private readonly contract: Contract;
   private readonly server: rpc.Server;
   private readonly networkPassphrase: string;
+  private readonly network: StellarNetwork;
 
   constructor(
     contractId: string,
     rpcUrl: string,
     networkPassphrase: string = Networks.TESTNET,
   ) {
+    // Resolve the canonical network config and reject any mismatch between the
+    // supplied passphrase, the configured network, and the RPC/contract IDs.
+    const config = getNetworkConfig();
+    assertNetworkMatch(config.network, networkPassphrase, 'BookingClient');
+
+    this.network = config.network;
     this.contract = new Contract(contractId);
     this.server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
     this.networkPassphrase = networkPassphrase;
+  }
+
+  /** The Stellar network this client is bound to. */
+  getNetwork(): StellarNetwork {
+    return this.network;
+  }
+
+  /** The network passphrase this client signs and simulates with. */
+  getNetworkPassphrase(): string {
+    return this.networkPassphrase;
+  }
+
+  /**
+   * Validate that a wallet-reported network matches this client's network.
+   * Throws an actionable error on mismatch so callers can block signing.
+   */
+  assertWalletNetwork(walletNetwork: StellarNetwork | string): void {
+    assertNetworkMatch(this.network, walletNetwork, 'BookingClient wallet');
+  }
+
+  /**
+   * Submit a signed transaction envelope, persist its hash + network, and
+   * track confirmation with bounded polling.
+   *
+   * On polling timeout the outcome is reported as `unresolved` (never a final
+   * failure) so the caller can hand it to reconciliation.
+   */
+  async submitAndTrack(
+    signedXdr: string,
+    record: TransactionRecord,
+  ): Promise<PollOutcome> {
+    assertNetworkMatch(this.network, record.network, 'BookingClient submit');
+
+    const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    const sendResponse = await this.server.sendTransaction(tx);
+
+    if (sendResponse.status === 'ERROR') {
+      return {
+        status: 'failed',
+        hash: record.hash,
+        network: this.network,
+        error: `Submission rejected: ${JSON.stringify(sendResponse.errorResult ?? sendResponse)}`,
+      };
+    }
+
+    return pollTransaction(this.server, {
+      ...record,
+      hash: sendResponse.hash,
+      network: this.network,
+    });
+  }
+
+  /**
+   * Reconcile a previously submitted transaction by hash. Used when polling
+   * timed out or the process restarted before confirmation.
+   */
+  async reconcile(hash: string, network: StellarNetwork | string): Promise<PollOutcome> {
+    assertNetworkMatch(this.network, network, 'BookingClient reconcile');
+    return pollTransaction(this.server, {
+      hash,
+      network: this.network,
+      submittedAt: Date.now(),
+    });
   }
 
   // ── Read-only queries ─────────────────────────────────────────────────────
@@ -257,6 +337,10 @@ export class BookingClient {
     method: string,
     args: xdr.ScVal[],
   ): Promise<xdr.ScVal> {
+    // Re-assert the network before every quote/simulation so a misconfigured
+    // environment cannot silently query the wrong chain.
+    assertNetworkMatch(this.network, getNetworkConfig().network, 'BookingClient quote');
+
     const sourceAccount = await this.server.getAccount(
       process.env.STELLAR_SOURCE_ACCOUNT ||
         'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',

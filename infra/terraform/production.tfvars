@@ -33,6 +33,37 @@ frontend_cpu           = 512
 frontend_memory        = 1024
 frontend_desired_count = 2
 
+# ── Stellar network configuration ─────────────────────────────────────────────
+# Production must be pinned to the public network.  There is deliberately no
+# default: a missing value fails the plan instead of silently using testnet.
+stellar_network             = "public"
+stellar_network_passphrase  = "Public Global Stellar Network ; September 2015"
+stellar_horizon_url         = "https://horizon.stellar.org"
+stellar_rpc_url             = "https://soroban-rpc.stellar.org"
+stellar_network_mismatch_policy = "reject"
+
+# ── Contract version registry ─────────────────────────────────────────────────
+# Each entry pins the deployed contract ID, WASM hash and ABI version for the
+# public network.  Startup validation rejects unknown or mismatched values.
+contract_registry = {
+  rentars_escrow = {
+    network          = "public"
+    contract_id      = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPROD"
+    wasm_hash        = "0000000000000000000000000000000000000000000000000000000000000000"
+    abi_version      = "1.0.0"
+    init_dependencies = []
+    compatible_app_releases = ["1.0.0"]
+  }
+  rentars_payments = {
+    network          = "public"
+    contract_id      = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBPROD"
+    wasm_hash        = "0000000000000000000000000000000000000000000000000000000000000000"
+    abi_version      = "1.0.0"
+    init_dependencies = ["rentars_escrow"]
+    compatible_app_releases = ["1.0.0"]
+  }
+}
+
 # ── WAF ───────────────────────────────────────────────────────────────────────
 waf_rate_limit_per_5m = 2000
 

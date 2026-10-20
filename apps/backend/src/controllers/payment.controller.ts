@@ -15,6 +15,9 @@ import {
   submitTransaction,
   confirmTransaction,
   retryTransaction,
+  getActiveNetwork,
+  assertNetworkMatch,
+  NetworkMismatchError,
 } from '@/services/stellar.service.js';
 
 const submitSchema = z.object({
@@ -22,11 +25,67 @@ const submitSchema = z.object({
   signedXdr: z.string().min(1, 'signedXdr is required'),
   amountUsdc: z.number().positive('amountUsdc must be positive'),
   metadata: z.record(z.unknown()).optional(),
+  network: z.string().min(1, 'network is required'),
 });
 
 const retrySchema = z.object({
   signedXdr: z.string().optional(),
+  network: z.string().min(1, 'network is required'),
 });
+
+const quoteSchema = z.object({
+  bookingId: z.string().uuid('bookingId must be a valid UUID'),
+  amountUsdc: z.number().positive('amountUsdc must be positive'),
+  network: z.string().min(1, 'network is required'),
+});
+
+/**
+ * Builds an actionable error payload for a wallet/backend network mismatch.
+ */
+function networkMismatchResponse(res: Response, err: NetworkMismatchError): void {
+  res.status(409).json({
+    error: {
+      code: 'NETWORK_MISMATCH',
+      message: err.message,
+      expectedNetwork: err.expectedNetwork,
+      receivedNetwork: err.receivedNetwork,
+      action: `Switch your wallet to ${err.expectedNetwork} and try again.`,
+    },
+  });
+}
+
+/**
+ * POST /api/v1/payments/quote
+ *
+ * Validates that the wallet's selected network matches the backend's active
+ * network before a payment intent is created. Returns the active network so
+ * the client can display it before user authorization.
+ *
+ * Body: { bookingId, amountUsdc, network }
+ * Returns: { network, amountUsdc }
+ */
+export async function quotePayment(req: AuthRequest, res: Response): Promise<void> {
+  const parsed = quoteSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors } });
+    return;
+  }
+
+  try {
+    assertNetworkMatch(parsed.data.network);
+  } catch (err) {
+    if (err instanceof NetworkMismatchError) {
+      networkMismatchResponse(res, err);
+      return;
+    }
+    throw err;
+  }
+
+  res.json({
+    network: getActiveNetwork(),
+    amountUsdc: parsed.data.amountUsdc,
+  });
+}
 
 /**
  * POST /api/v1/payments/submit
@@ -44,19 +103,41 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     return;
   }
 
-  const { bookingId, signedXdr, amountUsdc, metadata } = parsed.data;
+  const { bookingId, signedXdr, amountUsdc, metadata, network } = parsed.data;
   const tenantId = req.userId!;
 
-  // 1. Create payment intent in 'pending' state
-  const payment = await createPaymentIntent({ bookingId, tenantId, amountUsdc, metadata });
+  // 0. Reject wallet/backend network mismatch before any intent or broadcast
+  try {
+    assertNetworkMatch(network);
+  } catch (err) {
+    if (err instanceof NetworkMismatchError) {
+      networkMismatchResponse(res, err);
+      return;
+    }
+    throw err;
+  }
+
+  // 1. Create payment intent in 'pending' state, tagged with the active network
+  const payment = await createPaymentIntent({
+    bookingId,
+    tenantId,
+    amountUsdc,
+    metadata,
+    network: getActiveNetwork(),
+  });
 
   // 2. Submit signed XDR to Stellar
   let txHash: string;
   try {
-    const result = await submitTransaction(signedXdr);
+    const result = await submitTransaction(signedXdr, network);
     txHash = result.txHash;
     await updatePaymentStatus(payment.id, txHash, 'submitted');
   } catch (err) {
+    if (err instanceof NetworkMismatchError) {
+      await updatePaymentStatus(payment.id, null, 'failed');
+      networkMismatchResponse(res, err);
+      return;
+    }
     await updatePaymentStatus(payment.id, null, 'failed');
     res.status(502).json({
       error: {
@@ -67,12 +148,19 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     return;
   }
 
-  // 3. Kick off async confirmation polling (does not block the response)
+  // 3. Kick off async confirmation polling (does not block the response).
+  //    A polling timeout leaves the payment 'submitted' for reconciliation;
+  //    it is never reported as a final failure here.
   confirmTransaction(payment.id, txHash).catch((err) => {
     console.error('[Payment] Confirmation polling failed for', payment.id, err);
   });
 
-  res.status(202).json({ paymentId: payment.id, status: 'submitted', txHash });
+  res.status(202).json({
+    paymentId: payment.id,
+    status: 'submitted',
+    txHash,
+    network: getActiveNetwork(),
+  });
 }
 
 /**
@@ -96,11 +184,24 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
     return;
   }
 
+  // Distinguish submitted (broadcast, not yet ledger-confirmed) from confirmed.
+  const chainStatus =
+    payment.status === 'confirmed'
+      ? 'confirmed'
+      : payment.status === 'submitted'
+        ? 'submitted'
+        : payment.status === 'failed'
+          ? 'failed'
+          : 'pending';
+
   res.json({
     paymentId: payment.id,
     bookingId: payment.booking_id,
     status: payment.status,
+    chainStatus,
+    confirmed: payment.status === 'confirmed',
     txHash: payment.stellar_tx_hash,
+    network: payment.network ?? getActiveNetwork(),
     amountUsdc: payment.amount_usdc,
     updatedAt: payment.updated_at,
   });
@@ -134,10 +235,30 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
     return;
   }
 
+  // Reject a wallet/backend network mismatch before any re-submission
   try {
-    const result = await retryTransaction(id, parsed.data.signedXdr);
-    res.json({ paymentId: id, txHash: result.txHash, status: result.status });
+    assertNetworkMatch(parsed.data.network);
   } catch (err) {
+    if (err instanceof NetworkMismatchError) {
+      networkMismatchResponse(res, err);
+      return;
+    }
+    throw err;
+  }
+
+  try {
+    const result = await retryTransaction(id, parsed.data.signedXdr, parsed.data.network);
+    res.json({
+      paymentId: id,
+      txHash: result.txHash,
+      status: result.status,
+      network: getActiveNetwork(),
+    });
+  } catch (err) {
+    if (err instanceof NetworkMismatchError) {
+      networkMismatchResponse(res, err);
+      return;
+    }
     res.status(422).json({
       error: {
         code: 'RETRY_FAILED',

@@ -13,11 +13,7 @@ import {
   scValToNative,
   xdr,
 } from '@stellar/stellar-sdk';
-import {
-  BOOKING_CONTRACT_ID,
-  NETWORK_PASSPHRASE,
-  STELLAR_SOURCE_ACCOUNT,
-} from './config.js';
+import { NETWORK_PASSPHRASE, STELLAR_SOURCE_ACCOUNT } from './config.js';
 import {
   getSorobanServer,
   simulateReadOnly,
@@ -26,12 +22,63 @@ import {
 import { buildPrepareAndSign, extractReturnValue } from './transactionUtils.js';
 import { ContractError } from './errors.js';
 import type { BookingStatus, EscrowStatus } from './types.js';
+import {
+  assertBookingContractReady,
+  getBookingContractId,
+  getBookingContractMetadata,
+  getNetworkPassphrase,
+} from './contractRegistry.js';
 
-function requireContractId(): void {
-  if (!BOOKING_CONTRACT_ID) {
+/**
+ * Resolve the booking contract ID from the centralized registry, rejecting
+ * calls when the registry has not been validated or the network mismatches.
+ */
+function requireContractId(): string {
+  assertBookingContractReady();
+  const contractId = getBookingContractId();
+  if (!contractId) {
     throw new ContractError(
-      'BOOKING_CONTRACT_ID environment variable is not set — ' +
+      'BOOKING_CONTRACT_ID is not registered for the active network — ' +
         'configure it with a valid Soroban contract address before using booking operations',
+    );
+  }
+  return contractId;
+}
+
+/**
+ * Assert that the network the client is about to use matches the registry.
+ * Prevents signing/submitting against the wrong Stellar network.
+ */
+function requireNetworkMatch(): void {
+  const registryPassphrase = getNetworkPassphrase();
+  if (registryPassphrase !== NETWORK_PASSPHRASE) {
+    throw new ContractError(
+      `Network mismatch: registry expects "${registryPassphrase}" but the ` +
+        `client is configured for "${NETWORK_PASSPHRASE}". Refusing to sign or submit.`,
+    );
+  }
+}
+
+/**
+ * Validate the configured contract ID and ABI version at startup.
+ * Throws a ContractError if the registry is missing, unknown, or incompatible.
+ */
+export function validateBookingContractConfig(): void {
+  assertBookingContractReady();
+  const metadata = getBookingContractMetadata();
+  if (!metadata) {
+    throw new ContractError(
+      'Booking contract metadata is not registered for the active network',
+    );
+  }
+  if (!metadata.contractId) {
+    throw new ContractError(
+      'Booking contract ID is missing from the registry for the active network',
+    );
+  }
+  if (!metadata.abiVersion) {
+    throw new ContractError(
+      'Booking contract ABI version is missing from the registry',
     );
   }
 }
@@ -54,10 +101,11 @@ export async function checkAvailability(
   startDate: bigint,
   endDate: bigint,
 ): Promise<boolean> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const sourceAccount = await server.getAccount(STELLAR_SOURCE_ACCOUNT);
   const tx = new TransactionBuilder(sourceAccount, {
@@ -97,10 +145,11 @@ export async function createBookingOnChain(
   endDate: bigint,
   totalPrice: bigint,
 ): Promise<bigint> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const op = contract.call(
     'create_booking',
@@ -135,10 +184,11 @@ export async function cancelBookingOnChain(
   bookingId: bigint,
   callerAddress: string,
 ): Promise<void> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const op = contract.call(
     'cancel_booking',
@@ -162,10 +212,11 @@ export async function updateBookingStatusOnChain(
   newStatus: BookingStatus,
   callerAddress: string,
 ): Promise<void> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const op = contract.call(
     'update_status',
@@ -190,10 +241,11 @@ export async function setTokenAddressOnChain(
   tokenAddress: string,
   callerAddress: string,
 ): Promise<void> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const op = contract.call(
     'set_token_address',
@@ -216,10 +268,11 @@ export async function fundEscrowOnChain(
   tenant: string,
   bookingId: bigint,
 ): Promise<void> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const op = contract.call(
     'fund_escrow',
@@ -241,10 +294,11 @@ export async function disputeBookingOnChain(
   tenant: string,
   bookingId: bigint,
 ): Promise<void> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const op = contract.call(
     'dispute_booking',
@@ -269,10 +323,11 @@ export async function resolveDisputeOnChain(
   bookingId: bigint,
   releaseToOwner: boolean,
 ): Promise<void> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const op = contract.call(
     'resolve_dispute',
@@ -291,10 +346,11 @@ export async function resolveDisputeOnChain(
  * @returns The token contract address.
  */
 export async function getTokenAddressOnChain(): Promise<string> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const sourceAccount = await server.getAccount(STELLAR_SOURCE_ACCOUNT);
   const tx = new TransactionBuilder(sourceAccount, {
@@ -323,10 +379,11 @@ export async function getBookingWithEscrow(bookingId: bigint): Promise<{
   tenant: string;
   total_price: bigint;
 }> {
-  requireContractId();
+  const contractId = requireContractId();
+  requireNetworkMatch();
 
   const server = getSorobanServer();
-  const contract = new Contract(BOOKING_CONTRACT_ID);
+  const contract = new Contract(contractId);
 
   const sourceAccount = await server.getAccount(STELLAR_SOURCE_ACCOUNT);
   const tx = new TransactionBuilder(sourceAccount, {

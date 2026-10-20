@@ -12,6 +12,7 @@
 
 import { supabase } from '@/config/supabase.js';
 import type { AdminRole } from '@/config/adminScopes.js';
+import { getStellarNetworkConfig, type StellarNetwork } from '@/config/stellar.js';
 
 /**
  * Booking operations covered by the operation-to-role matrix below.
@@ -35,6 +36,35 @@ export interface BookingActor {
 export type BookingAuthorizationDecision =
   | { allowed: true }
   | { allowed: false; status: 403 | 404; reason: string };
+
+/**
+ * Context describing the wallet operation that accompanies a booking action.
+ *
+ * Signing, submission, and reconciliation must all refer to the same Stellar
+ * network, and the signing address must belong to the operation owner. When
+ * this context is supplied, the service rejects stale or mismatched
+ * signatures before the operation is authorized.
+ */
+export interface BookingOperationContext {
+  /** Stellar network the client signed on (e.g. 'testnet' or 'mainnet'). */
+  network?: string;
+  /** Public key that produced the signature. */
+  signerAddress?: string;
+  /** Public key expected to own the operation (tenant or host). */
+  ownerAddress?: string;
+  /** Ledger sequence the signature was produced against, if known. */
+  signedLedger?: number;
+  /** Current ledger sequence, used to reject stale signatures. */
+  currentLedger?: number;
+  /** Maximum age (in ledgers) a signature may have before it is stale. */
+  maxSignatureAgeLedgers?: number;
+}
+
+const DEFAULT_MAX_SIGNATURE_AGE_LEDGERS = 120;
+
+function normalizeNetwork(value: string): string {
+  return value.trim().toLowerCase();
+}
 
 interface OperationPolicy {
   /** Roles that may perform the operation on any booking, regardless of ownership. */
@@ -72,9 +102,17 @@ export class BookingAuthorizationService {
     operation: BookingOperation,
     bookingId: string,
     actor: BookingActor,
+    context?: BookingOperationContext,
   ): Promise<BookingAuthorizationDecision> {
     if (!actor.id) {
       return { allowed: false, status: 403, reason: 'Forbidden: unauthenticated actor' };
+    }
+
+    if (context) {
+      const rejection = this.validateOperationContext(context);
+      if (rejection) {
+        return rejection;
+      }
     }
 
     const policy = BOOKING_OPERATION_POLICY[operation];
@@ -99,6 +137,82 @@ export class BookingAuthorizationService {
     }
 
     return { allowed: false, status: 404, reason: 'Booking not found' };
+  }
+
+  /**
+   * Validate the wallet operation context against the configured network and
+   * the operation owner. Returns a rejection decision, or null when the
+   * context is consistent and may proceed.
+   */
+  validateOperationContext(context: BookingOperationContext): BookingAuthorizationDecision | null {
+    let configuredNetwork: StellarNetwork;
+    try {
+      configuredNetwork = getStellarNetworkConfig().network;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown network configuration error';
+      return {
+        allowed: false,
+        status: 403,
+        reason: `Network configuration is invalid: ${message}. Contact support before retrying.`,
+      };
+    }
+
+    if (!context.network) {
+      return {
+        allowed: false,
+        status: 403,
+        reason:
+          'Missing network in signing context. Reconnect your wallet and retry so the request is signed on the configured network.',
+      };
+    }
+
+    if (normalizeNetwork(context.network) !== normalizeNetwork(configuredNetwork)) {
+      return {
+        allowed: false,
+        status: 403,
+        reason: `Network mismatch: wallet signed on "${context.network}" but this service operates on "${configuredNetwork}". Switch your wallet to ${configuredNetwork} and retry.`,
+      };
+    }
+
+    if (!context.signerAddress) {
+      return {
+        allowed: false,
+        status: 403,
+        reason:
+          'Missing signing address. Reconnect your wallet and retry so the operation is signed by the expected account.',
+      };
+    }
+
+    if (!context.ownerAddress) {
+      return {
+        allowed: false,
+        status: 403,
+        reason:
+          'Missing operation owner address. Refresh the booking and retry so the signing account can be verified.',
+      };
+    }
+
+    if (context.signerAddress !== context.ownerAddress) {
+      return {
+        allowed: false,
+        status: 403,
+        reason: `Signing address ${context.signerAddress} does not match the operation owner ${context.ownerAddress}. Switch back to the owning account in your wallet and retry.`,
+      };
+    }
+
+    if (context.signedLedger !== undefined && context.currentLedger !== undefined) {
+      const maxAge = context.maxSignatureAgeLedgers ?? DEFAULT_MAX_SIGNATURE_AGE_LEDGERS;
+      const age = context.currentLedger - context.signedLedger;
+      if (age < 0 || age > maxAge) {
+        return {
+          allowed: false,
+          status: 403,
+          reason: `Signature is stale (signed at ledger ${context.signedLedger}, current ledger ${context.currentLedger}). Re-sign the operation and retry.`,
+        };
+      }
+    }
+
+    return null;
   }
 
   /**

@@ -83,6 +83,9 @@ const PROVIDER_STATUS_MAP: Readonly<Record<string, PaymentStatus>> = {
   created:   'pending',
 };
 
+/** Stellar network a transaction was broadcast to. */
+export type StellarNetwork = 'testnet' | 'mainnet' | 'futurenet';
+
 export interface Payment {
   id: string;
   booking_id: string;
@@ -92,6 +95,8 @@ export interface Payment {
   /** Supported currency token — currently only USDC. */
   currency: 'USDC';
   stellar_tx_hash: string | null;
+  /** Network the transaction hash was broadcast to (persisted with the hash). */
+  stellar_network: StellarNetwork | null;
   /** TrustlessWork escrow contract ID, if applicable. */
   escrow_id: string | null;
   /** Quote reference hash signed at intent creation (for amount integrity). */
@@ -121,6 +126,23 @@ export interface TransitionResult {
   payment: Payment;
   /** True when the event was a duplicate (same hash) — no side-effects applied. */
   replayed: boolean;
+}
+
+/**
+ * Options for a status transition.
+ */
+export interface TransitionOptions {
+  /** Stellar transaction hash to persist alongside the transition. */
+  txHash?: string | null;
+  /** Network the transaction was broadcast to. */
+  network?: StellarNetwork | null;
+  /** Actor UUID for audit (omit for system actions). */
+  actorId?: string;
+  /**
+   * When true, a `timed_out` transition is recorded as unresolved (pending
+   * reconciliation) rather than a final failure. Defaults to true.
+   */
+  unresolvedOnTimeout?: boolean;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -221,6 +243,7 @@ export async function transitionPaymentStatus(
   eventPayload: Record<string, unknown>,
   txHash?: string | null,
   actorId?: string,
+  options?: TransitionOptions,
 ): Promise<ServiceResponse<TransitionResult>> {
   const payment = await getPaymentStatus(paymentId);
   if (!payment) {
@@ -228,9 +251,21 @@ export async function transitionPaymentStatus(
   }
 
   const eventHash = hashEventPayload(eventPayload);
+  const network = options?.network ?? null;
+  const unresolvedOnTimeout = options?.unresolvedOnTimeout ?? true;
 
   // ── Idempotency: same event hash → replay without side-effects ────────────
   if (payment.last_event_hash === eventHash) {
+    return {
+      success: true,
+      data: { payment, replayed: true },
+    };
+  }
+
+  // ── Idempotency: confirmed is terminal for chain updates ──────────────────
+  // A confirmed payment must be recorded exactly once. Any further chain
+  // status update (e.g. a late duplicate confirmation) is a no-op replay.
+  if (payment.status === 'confirmed' && newStatus === 'confirmed') {
     return {
       success: true,
       data: { payment, replayed: true },
@@ -255,10 +290,24 @@ export async function transitionPaymentStatus(
     updated_at: new Date().toISOString(),
   };
   if (txHash !== undefined) updatePayload.stellar_tx_hash = txHash;
+  if (network !== null) updatePayload.stellar_network = network;
+
+  // A polling timeout is NOT a final failure: record it as unresolved so
+  // reconciliation can later resolve the transaction to confirmed/failed.
+  if (targetStatus === 'timed_out' && unresolvedOnTimeout) {
+    updatePayload.metadata = {
+      ...(payment.metadata ?? {}),
+      reconciliation_required: true,
+      reconciliation_reason: 'polling_timeout',
+      unresolved_at: new Date().toISOString(),
+    };
+  }
+
   if (quarantineReason) {
     // Store quarantine reason in metadata for manual review
     updatePayload.metadata = {
       ...(payment.metadata ?? {}),
+      ...((updatePayload.metadata as Record<string, unknown> | undefined) ?? {}),
       quarantine_reason: quarantineReason,
       quarantined_at: new Date().toISOString(),
     };
@@ -290,7 +339,7 @@ export async function transitionPaymentStatus(
     ('payment.submit' as const);
 
   await auditLogger.log({
-    actorId,
+    actorId: options?.actorId ?? actorId,
     action: auditAction,
     resourceType: 'payment',
     resourceId: paymentId,
@@ -298,6 +347,7 @@ export async function transitionPaymentStatus(
       fromStatus: payment.status,
       toStatus: targetStatus,
       txHash,
+      network,
       quarantineReason,
     },
   });
@@ -379,6 +429,7 @@ function rowToPayment(row: any): Payment {
     amount_stroops:   BigInt(row.amount_stroops ?? row.amount_usdc ?? 0),
     currency:         row.currency ?? 'USDC',
     stellar_tx_hash:  row.stellar_tx_hash ?? null,
+    stellar_network:  (row.stellar_network as StellarNetwork | null) ?? null,
     escrow_id:        row.escrow_id ?? null,
     quote_hash:       row.quote_hash ?? null,
     status:           row.status as PaymentStatus,

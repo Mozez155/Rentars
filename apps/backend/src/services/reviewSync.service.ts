@@ -37,6 +37,9 @@ import {
   REVIEW_CONTRACT_ID,
   NETWORK_PASSPHRASE,
   STELLAR_RPC_URL,
+  NETWORK,
+  assertNetworkConfigured,
+  isNetworkMismatch,
 } from '@/blockchain/config.js';
 import { ReviewClient } from '@/blockchain/reviewClient.js';
 import { supabase } from '@/config/supabase.js';
@@ -86,9 +89,41 @@ interface DBReview {
   on_chain_ledger: number | null;
 }
 
+// ─── Confirmation tracking ───────────────────────────────────────────────────
+
+export type ChainConfirmationStatus =
+  | 'not_found'
+  | 'pending'
+  | 'confirmed'
+  | 'failed'
+  | 'unresolved';
+
+export interface ChainConfirmationResult {
+  status: ChainConfirmationStatus;
+  txHash: string;
+  network: string;
+  ledger?: number;
+  error?: string;
+}
+
+/** Bounded polling defaults for confirmation tracking. */
+const CONFIRMATION_POLL_INITIAL_MS = 1_000;
+const CONFIRMATION_POLL_MAX_MS = 8_000;
+const CONFIRMATION_POLL_DEADLINE_MS = 60_000;
+
 // ─── Client builder ──────────────────────────────────────────────────────────
 
-function buildReviewClient(): ReviewClient {
+/**
+ * Build a review client, refusing to proceed when the configured network is
+ * missing or when the caller's expected network does not match the server's.
+ */
+function buildReviewClient(expectedNetwork?: string): ReviewClient {
+  assertNetworkConfigured();
+  if (expectedNetwork && isNetworkMismatch(expectedNetwork)) {
+    throw new Error(
+      `Network mismatch: request targets "${expectedNetwork}" but backend is configured for "${NETWORK}".`,
+    );
+  }
   return new ReviewClient(REVIEW_CONTRACT_ID, STELLAR_RPC_URL, NETWORK_PASSPHRASE);
 }
 
@@ -109,9 +144,16 @@ function buildReviewClient(): ReviewClient {
  */
 export async function reconcileReview(
   reviewId: string,
+  expectedNetwork?: string,
 ): Promise<ServiceResponse<{ status: ReconciliationStatus }>> {
   if (!REVIEW_CONTRACT_ID) {
     return { success: false, error: 'REVIEW_CONTRACT_ID is not configured' };
+  }
+  if (expectedNetwork && isNetworkMismatch(expectedNetwork)) {
+    return {
+      success: false,
+      error: `Network mismatch: review was submitted on "${expectedNetwork}" but backend is configured for "${NETWORK}".`,
+    };
   }
 
   // Fetch the DB review row
@@ -132,7 +174,12 @@ export async function reconcileReview(
     return { success: true, data: { status: 'none' } };
   }
 
-  const client = buildReviewClient();
+  let client: ReviewClient;
+  try {
+    client = buildReviewClient(expectedNetwork);
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
 
   let chainReview: ChainReview;
   try {
@@ -228,7 +275,12 @@ export async function detectOrphanedReviews(): Promise<ServiceResponse<{
     return { success: false, error: 'REVIEW_CONTRACT_ID is not configured' };
   }
 
-  const client = buildReviewClient();
+  let client: ReviewClient;
+  try {
+    client = buildReviewClient();
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
 
   let totalCount: bigint;
   try {
@@ -555,10 +607,19 @@ export async function recordOnChainSubmission(
   txHash?: string,
   ledger?: number,
   timestamp?: number,
+  expectedNetwork?: string,
 ): Promise<ServiceResponse<void>> {
+  if (expectedNetwork && isNetworkMismatch(expectedNetwork)) {
+    return {
+      success: false,
+      error: `Network mismatch: submission targets "${expectedNetwork}" but backend is configured for "${NETWORK}".`,
+    };
+  }
+
   const updatePayload: Record<string, unknown> = {
     on_chain_id: onChainId,
     reconciliation_status: 'pending',
+    on_chain_network: NETWORK,
   };
 
   // Immutable chain references — only set if provided and not already set.
@@ -573,4 +634,152 @@ export async function recordOnChainSubmission(
 
   if (error) return { success: false, error: error.message };
   return { success: true };
+}
+
+/**
+ * Track the confirmation status of a submitted review transaction.
+ *
+ * Uses bounded exponential-backoff polling against the RPC.  Distinguishes
+ * not-found, pending, failed, and confirmed outcomes.  When the polling
+ * deadline is exceeded the transaction is reported as `unresolved` (never as
+ * a final failure) so reconciliation can resolve it later.
+ *
+ * The DB update is idempotent: a transaction already marked confirmed is not
+ * re-applied, and a later poll cannot downgrade a confirmed status.
+ *
+ * @param reviewId       - UUID of the off-chain review
+ * @param txHash         - Transaction hash returned by broadcast
+ * @param expectedNetwork - Network the transaction was broadcast on
+ */
+export async function trackReviewConfirmation(
+  reviewId: string,
+  txHash: string,
+  expectedNetwork?: string,
+): Promise<ServiceResponse<ChainConfirmationResult>> {
+  if (expectedNetwork && isNetworkMismatch(expectedNetwork)) {
+    return {
+      success: false,
+      error: `Network mismatch: transaction was broadcast on "${expectedNetwork}" but backend is configured for "${NETWORK}".`,
+    };
+  }
+
+  // Persist the hash + network immediately so reconciliation can find it even
+  // if this process dies mid-poll.
+  const { error: persistError } = await supabase
+    .from('reviews')
+    .update({
+      on_chain_tx_hash: txHash,
+      on_chain_network: NETWORK,
+      reconciliation_status: 'pending',
+    })
+    .eq('id', reviewId);
+
+  if (persistError) return { success: false, error: persistError.message };
+
+  let client: ReviewClient;
+  try {
+    client = buildReviewClient(expectedNetwork);
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+
+  const deadline = Date.now() + CONFIRMATION_POLL_DEADLINE_MS;
+  let delay = CONFIRMATION_POLL_INITIAL_MS;
+  let lastStatus: ChainConfirmationStatus = 'not_found';
+
+  while (Date.now() < deadline) {
+    try {
+      const tx = await client.getTransaction(txHash);
+      if (tx) {
+        if (tx.status === 'SUCCESS') {
+          await applyConfirmedStatus(reviewId, txHash, tx.ledger);
+          return {
+            success: true,
+            data: { status: 'confirmed', txHash, network: NETWORK, ledger: tx.ledger },
+          };
+        }
+        if (tx.status === 'FAILED') {
+          await applyFailedStatus(reviewId, txHash);
+          return {
+            success: true,
+            data: { status: 'failed', txHash, network: NETWORK, error: 'Transaction failed on-chain' },
+          };
+        }
+        lastStatus = 'pending';
+      } else {
+        lastStatus = 'not_found';
+      }
+    } catch (err) {
+      // Transient RPC error — keep polling until the deadline.
+      console.warn(`[reviewSync] Confirmation poll error for ${txHash}:`, (err as Error).message);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(delay * 2, CONFIRMATION_POLL_MAX_MS);
+  }
+
+  // Deadline exceeded — hand off to reconciliation without implying failure.
+  return {
+    success: true,
+    data: {
+      status: 'unresolved',
+      txHash,
+      network: NETWORK,
+      error: `Confirmation not observed within deadline (last status: ${lastStatus}); queued for reconciliation.`,
+    },
+  };
+}
+
+/**
+ * Idempotently mark a review transaction as confirmed.  Only transitions from
+ * a non-confirmed state; repeated calls are no-ops.
+ */
+async function applyConfirmedStatus(
+  reviewId: string,
+  txHash: string,
+  ledger?: number,
+): Promise<void> {
+  const { data: existing } = await supabase
+    .from('reviews')
+    .select('reconciliation_status, on_chain_ledger')
+    .eq('id', reviewId)
+    .maybeSingle();
+
+  if (!existing) return;
+  if (existing.reconciliation_status === 'matched') return;
+
+  const updatePayload: Record<string, unknown> = {
+    reconciliation_status: 'matched',
+    reconciled_at: new Date().toISOString(),
+    on_chain_tx_hash: txHash,
+    on_chain_network: NETWORK,
+  };
+  if (ledger !== undefined && existing.on_chain_ledger === null) {
+    updatePayload.on_chain_ledger = ledger;
+  }
+
+  await supabase.from('reviews').update(updatePayload).eq('id', reviewId);
+}
+
+/**
+ * Idempotently mark a review transaction as failed on-chain.
+ */
+async function applyFailedStatus(reviewId: string, txHash: string): Promise<void> {
+  const { data: existing } = await supabase
+    .from('reviews')
+    .select('reconciliation_status')
+    .eq('id', reviewId)
+    .maybeSingle();
+
+  if (!existing) return;
+  if (existing.reconciliation_status === 'matched') return;
+
+  await supabase
+    .from('reviews')
+    .update({
+      reconciliation_status: 'mismatched',
+      on_chain_tx_hash: txHash,
+      on_chain_network: NETWORK,
+    })
+    .eq('id', reviewId);
 }

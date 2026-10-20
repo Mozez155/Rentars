@@ -86,3 +86,85 @@ export class QuoteInvalidatedError extends BlockchainError {
     this.name = 'QuoteInvalidatedError';
   }
 }
+
+export interface NetworkMismatchDetails {
+  readonly expectedNetwork: string;
+  readonly actualNetwork: string;
+  readonly source: 'wallet' | 'backend' | 'contract' | 'rpc' | 'intent';
+  readonly remediation: string;
+}
+
+export class NetworkMismatchError extends BlockchainError {
+  readonly expectedNetwork: string;
+  readonly actualNetwork: string;
+  readonly source: NetworkMismatchDetails['source'];
+  readonly remediation: string;
+
+  constructor(details: NetworkMismatchDetails) {
+    const message =
+      `Network mismatch detected (${details.source}): expected "${details.expectedNetwork}" ` +
+      `but received "${details.actualNetwork}". ${details.remediation}`;
+    super(message, 'NETWORK_MISMATCH');
+    this.name = 'NetworkMismatchError';
+    this.expectedNetwork = details.expectedNetwork;
+    this.actualNetwork = details.actualNetwork;
+    this.source = details.source;
+    this.remediation = details.remediation;
+  }
+
+  toJSON(): Record<string, unknown> {
+    return {
+      name: this.name,
+      code: this.code,
+      message: this.message,
+      expectedNetwork: this.expectedNetwork,
+      actualNetwork: this.actualNetwork,
+      source: this.source,
+      remediation: this.remediation,
+    };
+  }
+}
+
+export interface ContractConfigErrorDetails {
+  readonly contractId?: string;
+  readonly network?: string;
+  readonly reason: string;
+  readonly remediation: string;
+}
+
+export class ContractConfigError extends BlockchainError {
+  readonly contractId?: string;
+  readonly network?: string;
+  readonly reason: string;
+  readonly remediation: string;
+
+  constructor(details: ContractConfigErrorDetails) {
+    const context = [
+      details.contractId ? `contract "${details.contractId}"` : 'contract configuration',
+      details.network ? `on network "${details.network}"` : undefined,
+    ]
+      .filter(Boolean)
+      .join(' ');
+    super(
+      `Invalid ${context}: ${details.reason}. ${details.remediation}`,
+      'CONTRACT_CONFIG_ERROR',
+    );
+    this.name = 'ContractConfigError';
+    this.contractId = details.contractId;
+    this.network = details.network;
+    this.reason = details.reason;
+    this.remediation = details.remediation;
+  }
+
+  toJSON(): Record<string, unknown> {
+    return {
+      name: this.name,
+      code: this.code,
+      message: this.message,
+      contractId: this.contractId,
+      network: this.network,
+      reason: this.reason,
+      remediation: this.remediation,
+    };
+  }
+}

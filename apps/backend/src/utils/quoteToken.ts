@@ -13,6 +13,8 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 
 export interface QuoteTokenClaims {
+  /** Stellar network the quote was computed for (e.g. "testnet", "mainnet"). */
+  net: string;
   /** Property ID the quote was computed for. */
   pid: string;
   /** Normalised check-in instant (ISO 8601). */
@@ -46,12 +48,19 @@ export function signQuoteToken(
 /**
  * Verify a token's signature and decode its claims.
  *
- * @returns The claims when the signature is valid, otherwise null. Expiry and
- *          input matching are the caller's responsibility.
+ * When `expectedNetwork` is provided, tokens issued for a different network are
+ * rejected. Callers that consume a quote for signing/submission should always
+ * pass the network the backend is configured for, so a quote minted on one
+ * network can never be replayed against another.
+ *
+ * @returns The claims when the signature is valid (and the network matches, if
+ *          required), otherwise null. Expiry and input matching are the
+ *          caller's responsibility.
  */
 export function verifyQuoteToken(
   token: string,
   secret: string = process.env.QUOTE_SIGNING_SECRET ?? '',
+  expectedNetwork?: string,
 ): QuoteTokenClaims | null {
   if (!secret || typeof token !== 'string') return null;
 
@@ -63,9 +72,15 @@ export function verifyQuoteToken(
   const actual = Buffer.from(signature, 'utf8');
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
 
+  let claims: QuoteTokenClaims;
   try {
-    return JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as QuoteTokenClaims;
+    claims = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as QuoteTokenClaims;
   } catch {
     return null;
   }
+
+  if (typeof claims?.net !== 'string' || !claims.net) return null;
+  if (expectedNetwork !== undefined && claims.net !== expectedNetwork) return null;
+
+  return claims;
 }

@@ -11,6 +11,149 @@
 
 import type { xdr } from '@stellar/stellar-sdk';
 
+// ─── Network Types ────────────────────────────────────────────────────────────
+
+/**
+ * Supported Stellar networks. Every signing, submission, contract, and RPC
+ * operation must agree on exactly one of these values.
+ */
+export type StellarNetwork = 'testnet' | 'mainnet' | 'futurenet';
+
+/** All networks the application knows how to talk to. */
+export const SUPPORTED_NETWORKS: readonly StellarNetwork[] = [
+  'testnet',
+  'mainnet',
+  'futurenet',
+] as const;
+
+/** Networks considered production-grade. */
+export const PRODUCTION_NETWORKS: readonly StellarNetwork[] = ['mainnet'] as const;
+
+/** Returns true when the given value is a supported Stellar network. */
+export function isStellarNetwork(value: unknown): value is StellarNetwork {
+  return typeof value === 'string' && (SUPPORTED_NETWORKS as readonly string[]).includes(value);
+}
+
+/**
+ * Raised whenever wallet, backend, contract, or RPC configuration disagree on
+ * the active network. Carries both sides so callers can surface an actionable
+ * message before any signing or broadcast occurs.
+ */
+export class NetworkMismatchError extends Error {
+  readonly code = 'NETWORK_MISMATCH' as const;
+  readonly expected: StellarNetwork;
+  readonly actual: StellarNetwork | string | null;
+
+  constructor(expected: StellarNetwork, actual: StellarNetwork | string | null, context?: string) {
+    const detail = context ? ` (${context})` : '';
+    super(
+      `Network mismatch${detail}: expected "${expected}" but received "${actual ?? 'unknown'}". ` +
+        `Switch your wallet to ${expected} and retry.`,
+    );
+    this.name = 'NetworkMismatchError';
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
+// ─── Transaction Status Types ─────────────────────────────────────────────────
+
+/**
+ * Lifecycle of a broadcast Stellar transaction.
+ *
+ * - `not_found`: RPC has not observed the hash yet (may still be in flight).
+ * - `pending`:   Observed in the mempool / not yet included in a ledger.
+ * - `failed`:    Included in a ledger but the operation failed.
+ * - `confirmed`: Included in a ledger and succeeded.
+ * - `unresolved`: Polling deadline elapsed without a final outcome; the
+ *                 transaction is handed to reconciliation.
+ */
+export type TransactionStatus =
+  | 'not_found'
+  | 'pending'
+  | 'failed'
+  | 'confirmed'
+  | 'unresolved';
+
+/** Terminal statuses that will not change without reconciliation. */
+export const TERMINAL_TRANSACTION_STATUSES: readonly TransactionStatus[] = [
+  'failed',
+  'confirmed',
+] as const;
+
+/** Returns true when the status is final and idempotent updates may stop. */
+export function isTerminalTransactionStatus(status: TransactionStatus): boolean {
+  return (TERMINAL_TRANSACTION_STATUSES as readonly string[]).includes(status);
+}
+
+/** Persisted record tracking a broadcast transaction through confirmation. */
+export interface TransactionRecord {
+  /** Hex-encoded transaction hash. */
+  tx_hash: string;
+  /** Network the transaction was broadcast on. */
+  network: StellarNetwork;
+  /** Current lifecycle status. */
+  status: TransactionStatus;
+  /** Ledger sequence the transaction was included in, when known. */
+  ledger?: number;
+  /** Unix timestamp (seconds) when the transaction was first submitted. */
+  submitted_at: number;
+  /** Unix timestamp (seconds) of the most recent status update. */
+  updated_at: number;
+  /** Number of polling attempts made so far. */
+  attempts: number;
+  /** Optional failure reason when status is `failed`. */
+  error?: string;
+}
+
+// ─── Contract Metadata Types ──────────────────────────────────────────────────
+
+/**
+ * Version registry entry describing a deployed contract on a given network.
+ * Used by startup validation and non-sensitive version health endpoints.
+ */
+export interface ContractMetadata {
+  /** Contract ID (Strkey `C...`) deployed on the network. */
+  contractId: string;
+  /** Network the contract is deployed on. */
+  network: StellarNetwork;
+  /** Hex-encoded WASM hash of the deployed bytecode. */
+  wasmHash: string;
+  /** ABI version string, e.g. "1.2.0". */
+  abiVersion: string;
+  /** Other contracts this contract depends on for initialization. */
+  initializationDependencies: string[];
+  /** Application release versions known to be compatible with this contract. */
+  compatibleAppReleases: string[];
+}
+
+/** Health summary for a single contract, safe to expose publicly. */
+export interface ContractHealth {
+  contractId: string;
+  network: StellarNetwork;
+  wasmHash: string;
+  abiVersion: string;
+  /** Whether the configured contract matches the registry entry. */
+  compatible: boolean;
+  /** Human-readable reason when `compatible` is false. */
+  issue?: string;
+}
+
+// ─── Blockchain Operation Types ───────────────────────────────────────────────
+
+/**
+ * Common envelope for a blockchain operation. Every intent is tagged with the
+ * network it targets and, once broadcast, the resulting transaction hash.
+ */
+export interface BlockchainOperation {
+  /** Network this operation must be signed and submitted on. */
+  network: StellarNetwork;
+  /** Transaction hash, populated after broadcast. */
+  tx_hash?: string;
+  /** Current confirmation status, populated after broadcast. */
+  status?: TransactionStatus;
+}
+
 // ─── Property Listing Types ───────────────────────────────────────────────────
 
 /** Mirrors ListingStatus enum in property_listing_abi.json */

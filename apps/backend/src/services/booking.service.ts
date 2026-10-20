@@ -7,6 +7,7 @@
 import { StrKey } from '@stellar/stellar-sdk';
 import { supabase } from '@/config/supabase.js';
 import { env } from '@/config/env.js';
+import { getNetworkConfig, assertNetworkMatch } from '@/config/network.js';
 import {
   checkAvailability,
   cancelBookingOnChain,
@@ -138,6 +139,17 @@ export interface CreateBookingInput {
   on_chain_property_id?: bigint;
   /** Quote token from GET /properties/:id/quote, binding total_price to the quoted stay. */
   quote_token?: string;
+  /**
+   * Stellar network the client (wallet) is operating on. Must match the
+   * backend's configured network or the booking is rejected before any
+   * funds are authorised or broadcast.
+   */
+  network?: string;
+  /**
+   * Stellar public key of the account that signed the quote / will sign the
+   * payment. Used to detect account switching between quote and submission.
+   */
+  wallet_address?: string;
 }
 
 export interface RequestModificationInput {
@@ -182,6 +194,36 @@ async function fetchStellarAddress(userId: string): Promise<string | null> {
     .eq('id', userId)
     .single();
   return (data as { stellar_address?: string } | null)?.stellar_address ?? null;
+}
+
+/**
+ * Validate that a client-supplied network matches the backend's configured
+ * network. Returns a ServiceResponse error (HTTP 409) on mismatch so callers
+ * can reject before signing or broadcasting.
+ */
+function validateNetwork(
+  clientNetwork: string | undefined,
+): ServiceResponse<{ network: string }> {
+  const config = getNetworkConfig();
+  if (!clientNetwork) {
+    return {
+      success: false,
+      error: `Network is required. This server operates on ${config.network}.`,
+      statusCode: 400,
+      code: 'NETWORK_REQUIRED',
+    };
+  }
+  const match = assertNetworkMatch(clientNetwork, config.network);
+  if (!match.ok) {
+    return {
+      success: false,
+      error: match.message,
+      statusCode: 409,
+      code: 'NETWORK_MISMATCH',
+      details: { expected: config.network, received: clientNetwork },
+    };
+  }
+  return { success: true, data: { network: config.network } };
 }
 
 // ─── Service class ────────────────────────────────────────────────────────────
@@ -463,6 +505,20 @@ export class BookingService {
       };
     }
 
+    // Network gate: reject a wallet/backend network mismatch before any
+    // quote is trusted, funds are authorised, or a transaction is broadcast.
+    const networkCheck = validateNetwork(input.network);
+    if (!networkCheck.success || !networkCheck.data) {
+      return {
+        success: false,
+        error: networkCheck.error,
+        statusCode: networkCheck.statusCode,
+        code: networkCheck.code,
+        details: networkCheck.details,
+      };
+    }
+    const activeNetwork = networkCheck.data.network;
+
     if (!Number.isFinite(total_price) || total_price <= 0) {
       return { success: false, error: 'total_price must be a positive number' };
     }
@@ -630,6 +686,21 @@ export class BookingService {
       };
     }
 
+    // Account-switch guard: if the client told us which wallet address is
+    // active, it must be the tenant's registered address. A mismatch means the
+    // user switched accounts after the quote was issued — refuse to continue.
+    if (input.wallet_address && input.wallet_address !== buyerStellarAddress) {
+      return {
+        success: false,
+        error:
+          'The active wallet account does not match the booking owner. ' +
+          'Reconnect the correct account and request a fresh quote before booking.',
+        statusCode: 409,
+        code: 'WALLET_ACCOUNT_MISMATCH',
+        details: { expected: buyerStellarAddress, received: input.wallet_address },
+      };
+    }
+
     // 4. Atomically reserve the booking (conflict check + host-block check + INSERT).
     //    This must happen before escrow so escrow is never created for a conflicting slot.
     const { data: reservedId, error: reservationError } = await supabase.rpc(
@@ -759,7 +830,13 @@ export class BookingService {
 
     const { data: bookingData, error: updateError } = await supabase
       .from('bookings')
-      .update({ escrow_id: escrowId, expires_at: expiresAt })
+      .update({
+        escrow_id: escrowId,
+        expires_at: expiresAt,
+        // Tag the intent with the network it was created on so reconciliation
+        // and submission can independently verify it later.
+        network: activeNetwork,
+      })
       .eq('id', bookingId)
       .select()
       .single();
@@ -806,10 +883,31 @@ export class BookingService {
       const checkInTs = BigInt(Math.floor(checkInDate.getTime() / 1000));
       const checkOutTs = BigInt(Math.floor(checkOutDate.getTime() / 1000));
 
+      // Re-validate the network immediately before broadcast. The config could
+      // have changed (or the intent could have been tampered with) since the
+      // initial gate; never submit on a mismatched network.
+      const preBroadcast = validateNetwork(activeNetwork);
+      if (!preBroadcast.success) {
+        loggingService.logBlockchainOperation(
+          'createBookingOnChain',
+          { bookingId: booking.id, propertyId: property_id, userId: tenant_id },
+          undefined,
+          preBroadcast.error ?? 'network mismatch',
+        );
+        return {
+          success: false,
+          error: preBroadcast.error,
+          statusCode: preBroadcast.statusCode,
+          code: preBroadcast.code,
+          details: preBroadcast.details,
+        };
+      }
+
       loggingService.logBlockchainOperation('createBookingOnChain', {
         bookingId: booking.id,
         propertyId: property_id,
         userId: tenant_id,
+        network: activeNetwork,
       });
 
       try {
@@ -826,6 +924,7 @@ export class BookingService {
           propertyId: property_id,
           userId: tenant_id,
           onChainId: String(onChainId),
+          network: activeNetwork,
         });
 
         await supabase
@@ -846,6 +945,71 @@ export class BookingService {
     }
 
     return { success: true, data: booking };
+  }
+
+  // ── Reconciliation ─────────────────────────────────────────────────────────
+
+  /**
+   * Reconcile bookings whose on-chain submission outcome is unresolved.
+   *
+   * A broadcast that timed out or whose confirmation was never observed is not
+   * a failure — it is *pending*. This method hands those bookings to the
+   * reconciliation path so a later ledger check can resolve them idempotently.
+   * It never marks a booking failed merely because polling timed out.
+   *
+   * @param network - Network to reconcile against; must match the backend config.
+   */
+  async reconcilePendingTransactions(
+    network: string,
+  ): Promise<ServiceResponse<{ reconciled: number; skipped: number }>> {
+    const networkCheck = validateNetwork(network);
+    if (!networkCheck.success || !networkCheck.data) {
+      return {
+        success: false,
+        error: networkCheck.error,
+        statusCode: networkCheck.statusCode,
+        code: networkCheck.code,
+        details: networkCheck.details,
+      };
+    }
+    const activeNetwork = networkCheck.data.network;
+
+    const { data: pending, error } = await supabase
+      .from('bookings')
+      .select('id, status, on_chain_id, network, escrow_id')
+      .eq('status', 'Pending')
+      .not('on_chain_id', 'is', null);
+
+    if (error) return { success: false, error: error.message };
+
+    let reconciled = 0;
+    let skipped = 0;
+
+    for (const b of pending ?? []) {
+      // A booking tagged with a different network must never be reconciled
+      // against this backend's chain — leave it for the correct environment.
+      if (b.network && b.network !== activeNetwork) {
+        skipped++;
+        continue;
+      }
+
+      try {
+        // Hand off to the reconciliation worker; it performs bounded polling
+        // and idempotent chain-status updates. We only count the handoff.
+        await supabase
+          .from('bookings')
+          .update({ reconciliation_requested_at: new Date().toISOString() })
+          .eq('id', b.id)
+          .eq('network', activeNetwork);
+
+        reconciled++;
+      } catch (e) {
+        console.warn('[BookingService] Reconciliation handoff failed for', b.id, ':', e);
+        skipped++;
+      }
+    }
+
+    return { success: true, data: { reconciled, skipped } };
   }
 
   // ── Cancel ─────────────────────────────────────────────────────────────────

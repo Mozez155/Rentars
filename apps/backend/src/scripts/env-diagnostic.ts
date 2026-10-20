@@ -7,6 +7,12 @@
  */
 
 import 'dotenv/config';
+import {
+  resolveNetworkConfig,
+  getContractRegistry,
+  type NetworkConfig,
+  type ContractRegistryEntry,
+} from '../config/network';
 
 const REQUIRED_VARS = [
   'PORT',
@@ -31,6 +37,72 @@ const OPTIONAL_VARS = [
   'METRICS_TOKEN',
 ];
 
+function maskValue(key: string, value: string): string {
+  return key.includes('SECRET') || key.includes('KEY') || key.includes('PASSWORD')
+    ? '[REDACTED]'
+    : value.substring(0, 30) + (value.length > 30 ? '...' : '');
+}
+
+function reportNetworkConfig(): boolean {
+  console.log('\nStellar Network Configuration:');
+
+  let network: NetworkConfig;
+  try {
+    network = resolveNetworkConfig();
+  } catch (error) {
+    console.log(`  ❌ ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+
+  let ok = true;
+  console.log(`  ✅ Resolved network: ${network.network}`);
+  console.log(`  ✅ RPC URL: ${network.rpcUrl}`);
+  console.log(`  ✅ Network passphrase: ${network.networkPassphrase}`);
+
+  // Production must never silently fall back to testnet.
+  if (process.env.NODE_ENV === 'production' && network.network !== 'mainnet') {
+    console.log(
+      `  ❌ NODE_ENV=production but resolved network is "${network.network}". ` +
+        'Production must explicitly configure STELLAR_NETWORK=mainnet.',
+    );
+    ok = false;
+  }
+
+  let registry: ContractRegistryEntry[];
+  try {
+    registry = getContractRegistry(network.network);
+  } catch (error) {
+    console.log(`  ❌ ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+
+  console.log('\nContract Registry:');
+  if (registry.length === 0) {
+    console.log(`  ❌ No contracts registered for network "${network.network}".`);
+    return false;
+  }
+
+  for (const entry of registry) {
+    console.log(`  • ${entry.name}`);
+    console.log(`      contract ID: ${entry.contractId}`);
+    console.log(`      WASM hash:   ${entry.wasmHash}`);
+    console.log(`      ABI version: ${entry.abiVersion}`);
+    console.log(`      initialized: ${entry.initialized ? 'yes' : 'no'}`);
+    if (entry.dependsOn.length > 0) {
+      console.log(`      depends on:  ${entry.dependsOn.join(', ')}`);
+    }
+    if (entry.compatibleAppReleases.length > 0) {
+      console.log(`      app releases: ${entry.compatibleAppReleases.join(', ')}`);
+    }
+    if (!entry.initialized) {
+      console.log(`      ❌ ${entry.name} is not marked initialized.`);
+      ok = false;
+    }
+  }
+
+  return ok;
+}
+
 console.log('\n📋 Backend Environment Configuration Diagnostic\n');
 console.log('━'.repeat(60));
 console.log('\nRequired Configuration:');
@@ -43,11 +115,7 @@ for (const key of REQUIRED_VARS) {
     console.log(`  ❌ ${key}: MISSING`);
     hasErrors = true;
   } else {
-    // Mask sensitive values
-    const displayValue = key.includes('SECRET') || key.includes('KEY') || key.includes('PASSWORD')
-      ? '[REDACTED]'
-      : value.substring(0, 30) + (value.length > 30 ? '...' : '');
-    console.log(`  ✅ ${key}: ${displayValue}`);
+    console.log(`  ✅ ${key}: ${maskValue(key, value)}`);
   }
 }
 
@@ -58,19 +126,22 @@ for (const key of OPTIONAL_VARS) {
   if (!value) {
     console.log(`  ⚪ ${key}: NOT SET`);
   } else {
-    const displayValue = key.includes('SECRET') || key.includes('KEY') || key.includes('PASSWORD')
-      ? '[REDACTED]'
-      : value.substring(0, 30) + (value.length > 30 ? '...' : '');
-    console.log(`  ✅ ${key}: ${displayValue}`);
+    console.log(`  ✅ ${key}: ${maskValue(key, value)}`);
   }
 }
 
 console.log('\n━'.repeat(60));
 
+if (!reportNetworkConfig()) {
+  hasErrors = true;
+}
+
+console.log('\n━'.repeat(60));
+
 if (hasErrors) {
-  console.log('\n❌ Configuration incomplete. Fix missing required variables.\n');
+  console.log('\n❌ Configuration incomplete or inconsistent. Fix the issues above.\n');
   process.exit(1);
 } else {
-  console.log('\n✅ All required configuration present.\n');
+  console.log('\n✅ All required configuration present and network configuration is consistent.\n');
   process.exit(0);
 }

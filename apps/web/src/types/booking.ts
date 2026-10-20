@@ -52,6 +52,74 @@ export interface Booking {
   updated_at?: string;
 }
 
+// ─── On-chain transaction tracking ───────────────────────────────────────────
+
+/** Stellar networks a transaction may be broadcast to. */
+export type StellarNetwork = 'testnet' | 'mainnet' | 'futurenet' | 'standalone';
+
+/**
+ * Lifecycle of a broadcast transaction as observed by the client.
+ *
+ * - `submitted`: broadcast succeeded but ledger inclusion is not yet proven.
+ * - `pending`:   seen by the network / RPC but not yet confirmed.
+ * - `confirmed`: included in a ledger and successful.
+ * - `failed`:    included in a ledger but failed, or definitively rejected.
+ * - `unresolved`: polling deadline elapsed without a final outcome; must be
+ *                 handed to reconciliation rather than treated as failed.
+ */
+export type TransactionStatus =
+  | 'submitted'
+  | 'pending'
+  | 'confirmed'
+  | 'failed'
+  | 'unresolved';
+
+/** Persisted record of a broadcast Stellar transaction. */
+export interface TransactionRecord {
+  /** Transaction hash (hex). */
+  hash: string;
+  /** Network the transaction was broadcast to. */
+  network: StellarNetwork;
+  /** Current client-observed status. */
+  status: TransactionStatus;
+  /** Ledger sequence once confirmed, if known. */
+  ledger?: number;
+  /** ISO timestamp of the last status update. */
+  updated_at: string;
+  /** Human-readable failure reason when status is `failed`. */
+  error?: string;
+}
+
+// ─── Pending operation context ───────────────────────────────────────────────
+
+/**
+ * Context for an in-flight booking operation (e.g. escrow lock).
+ *
+ * The `owner_address` binds the operation to the wallet account that started
+ * it. If the active wallet address changes, the operation must be invalidated
+ * and the user must confirm before resuming.
+ */
+export interface PendingOperation {
+  /** Unique id for this operation attempt. */
+  id: string;
+  /** Booking the operation applies to. */
+  booking_id: string;
+  /** Stellar public key of the account that initiated the operation. */
+  owner_address: string;
+  /** Network the operation targets. */
+  network: StellarNetwork;
+  /** Transaction hash once broadcast, if any. */
+  tx_hash?: string;
+  /** Client-observed transaction status, if broadcast. */
+  tx_status?: TransactionStatus;
+  /** ISO timestamp the operation was started. */
+  started_at: string;
+  /** Whether the operation was invalidated by an account switch. */
+  invalidated?: boolean;
+  /** Reason the operation was invalidated, if applicable. */
+  invalidation_reason?: 'account_switch' | 'disconnect' | 'timeout';
+}
+
 export interface BookingFormData {
   checkIn: Date;
   checkOut: Date;

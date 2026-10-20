@@ -9,7 +9,6 @@
 
 import {
   Contract,
-  Networks,
   rpc,
   TransactionBuilder,
   nativeToScVal,
@@ -17,26 +16,81 @@ import {
   xdr,
 } from '@stellar/stellar-sdk';
 import type { Review, SubmitReviewParams } from './types.js';
-
-// ─── ABI metadata (sourced from review_abi.json) ─────────────────────────────
-const ABI_VERSION = '0.1.0';
-const CONTRACT_NAME = 'review-contract';
+import {
+  getContractRegistryEntry,
+  resolveNetworkConfig,
+  type ContractRegistryEntry,
+  type NetworkConfig,
+} from './contractRegistry.js';
 
 // ─── Client ──────────────────────────────────────────────────────────────────
 
 export class ReviewClient {
   private readonly contract: Contract;
   private readonly server: rpc.Server;
-  private readonly networkPassphrase: string;
+  private readonly network: NetworkConfig;
+  private readonly registry: ContractRegistryEntry;
 
-  constructor(
-    contractId: string,
-    rpcUrl: string,
-    networkPassphrase: string = Networks.TESTNET,
-  ) {
+  /**
+   * @param contractId  Contract ID to invoke. Must match the registry entry for
+   *                    the resolved network, otherwise construction fails.
+   * @param rpcUrl      Optional RPC URL override; defaults to the centralized
+   *                    network configuration.
+   * @param network     Optional network name (e.g. 'testnet', 'mainnet').
+   *                    Defaults to the centralized configuration; production
+   *                    never silently falls back to testnet.
+   */
+  constructor(contractId: string, rpcUrl?: string, network?: string) {
+    this.network = resolveNetworkConfig(network);
+    this.registry = getContractRegistryEntry(this.network.name);
+
+    if (contractId !== this.registry.contractId) {
+      throw new Error(
+        `Contract ID mismatch for network "${this.network.name}": ` +
+          `configured ${contractId}, registry expects ${this.registry.contractId}. ` +
+          `Refusing to initialize ReviewClient.`,
+      );
+    }
+
+    const resolvedRpcUrl = rpcUrl ?? this.network.rpcUrl;
     this.contract = new Contract(contractId);
-    this.server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
-    this.networkPassphrase = networkPassphrase;
+    this.server = new rpc.Server(resolvedRpcUrl, {
+      allowHttp: resolvedRpcUrl.startsWith('http://'),
+    });
+  }
+
+  /** Network name this client is bound to (e.g. 'testnet'). */
+  get networkName(): string {
+    return this.network.name;
+  }
+
+  /** Network passphrase this client is bound to. */
+  get networkPassphrase(): string {
+    return this.network.passphrase;
+  }
+
+  /** Registry metadata (contract ID, WASM hash, ABI version) for this network. */
+  get contractMetadata(): ContractRegistryEntry {
+    return this.registry;
+  }
+
+  /**
+   * Assert that a caller-supplied network matches this client's network.
+   * Used before submission and reconciliation to reject cross-network intents.
+   */
+  assertNetwork(expectedNetwork: string | undefined): void {
+    if (!expectedNetwork) {
+      throw new Error(
+        `Missing network on intent; this client is bound to "${this.network.name}". ` +
+          `Refusing to proceed.`,
+      );
+    }
+    if (expectedNetwork !== this.network.name) {
+      throw new Error(
+        `Network mismatch: intent targets "${expectedNetwork}" but backend is ` +
+          `configured for "${this.network.name}". Refusing to sign or submit.`,
+      );
+    }
   }
 
   // ── Read-only queries ─────────────────────────────────────────────────────
@@ -106,6 +160,9 @@ export class ReviewClient {
    *   - reviewer may only review each reviewee once
    */
   buildSubmitReview(params: SubmitReviewParams): xdr.Operation {
+    // Reject intents tagged for a different network before building the op.
+    this.assertNetwork(params.network);
+
     if (params.rating < 1 || params.rating > 5) {
       throw new RangeError(
         `Rating must be between 1 and 5 inclusive, got ${params.rating}`,
@@ -137,7 +194,7 @@ export class ReviewClient {
 
     const tx = new TransactionBuilder(sourceAccount, {
       fee: '100',
-      networkPassphrase: this.networkPassphrase,
+      networkPassphrase: this.network.passphrase,
     })
       .addOperation(this.contract.call(method, ...args))
       .setTimeout(30)
@@ -147,7 +204,7 @@ export class ReviewClient {
 
     if (rpc.Api.isSimulationError(simResult)) {
       throw new Error(
-        `Contract simulation failed [${CONTRACT_NAME}@${ABI_VERSION}::${method}]: ${simResult.error}`,
+        `Contract simulation failed [${this.registry.contractName}@${this.registry.abiVersion}::${method}]: ${simResult.error}`,
       );
     }
 

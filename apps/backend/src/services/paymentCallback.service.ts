@@ -29,6 +29,7 @@ import {
   hashEventPayload,
   getPaymentByBookingId,
 } from './payment.service.js';
+import { getStellarNetworkConfig, type StellarNetwork } from '@/config/stellarNetwork.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
@@ -59,6 +60,11 @@ export const callbackBodySchema = z.object({
   amountStroops: z.string().regex(/^\d+$/, 'amountStroops must be a non-negative integer string'),
   /** Provider's account or API-key identifier — must match env config. */
   providerAccountId: z.string().min(1),
+  /**
+   * Stellar network the event was emitted on. Optional for backwards
+   * compatibility, but when present it MUST match the configured network.
+   */
+  network: z.enum(['testnet', 'mainnet', 'futurenet']).optional(),
   /** Optional Stellar transaction hash associated with the event. */
   txHash: z.string().optional(),
 }).passthrough();
@@ -73,6 +79,7 @@ export type CallbackVerificationStatus =
   | 'invalid_signature'
   | 'invalid_timestamp'
   | 'invalid_payload'
+  | 'invalid_network'
   | 'mismatch'
   | 'quarantined';
 
@@ -125,13 +132,16 @@ async function isReplay(eventId: string): Promise<boolean> {
 
 /**
  * Persist an event ID to the replay ledger.
+ *
+ * Idempotent: the unique constraint on `event_id` means a concurrent or
+ * duplicate insert is ignored rather than creating a second ledger row.
  */
 async function recordEvent(
   eventId: string,
   bookingId: string,
   eventHash: string,
 ): Promise<void> {
-  await supabase
+  const { error } = await supabase
     .from('payment_callback_events')
     .insert({
       event_id: eventId,
@@ -139,7 +149,23 @@ async function recordEvent(
       event_hash: eventHash,
       created_at: new Date().toISOString(),
     })
-    .select(); // fire-and-forget but await to avoid unhandled rejections
+    .select();
+
+  // 23505 = unique_violation — a concurrent delivery already recorded it.
+  if (error && error.code !== '23505') {
+    console.error(`[Callback] Failed to record event ${eventId}:`, error.message);
+  }
+}
+
+/**
+ * Resolve the network the callback claims to be for, and compare it with the
+ * configured network. Returns null when the network is acceptable (or absent),
+ * otherwise returns the configured network for the rejection message.
+ */
+function resolveNetworkMismatch(claimed: StellarNetwork | undefined): StellarNetwork | null {
+  const config = getStellarNetworkConfig();
+  if (!claimed) return null;
+  return claimed === config.network ? null : config.network;
 }
 
 // ─── Main verifier ────────────────────────────────────────────────────────────
@@ -205,7 +231,24 @@ export async function verifyAndProcessCallback(
     };
   }
 
-  // ── 5. Provider account identity check ───────────────────────────────────
+  // ── 5. Network validation ─────────────────────────────────────────────────
+  // The backend independently rejects events tagged with a network other than
+  // the one it is configured for. This prevents testnet events from mutating
+  // mainnet payment state (and vice versa).
+  const configuredNetwork = resolveNetworkMismatch(body.network);
+  if (configuredNetwork !== null) {
+    console.error(
+      `[Callback] Network mismatch for bookingId=${body.bookingId}: ` +
+      `got=${body.network} expected=${configuredNetwork}`,
+    );
+    return {
+      status: 'invalid_network',
+      httpStatus: 422,
+      message: `Network mismatch — this endpoint only accepts ${configuredNetwork} events`,
+    };
+  }
+
+  // ── 6. Provider account identity check ───────────────────────────────────
   if (body.providerAccountId !== expectedProviderId) {
     // Potential cross-tenant injection; quarantine
     console.error(
@@ -218,7 +261,7 @@ export async function verifyAndProcessCallback(
     };
   }
 
-  // ── 6. Replay detection ───────────────────────────────────────────────────
+  // ── 7. Replay detection ───────────────────────────────────────────────────
   const eventHash = hashEventPayload(body as unknown as Record<string, unknown>);
 
   if (await isReplay(body.eventId)) {
@@ -229,7 +272,7 @@ export async function verifyAndProcessCallback(
     };
   }
 
-  // ── 7. Load payment and cross-reference booking + amount ─────────────────
+  // ── 8. Load payment and cross-reference booking + amount ─────────────────
   const payment = await getPaymentByBookingId(body.bookingId);
 
   if (!payment) {
@@ -264,7 +307,10 @@ export async function verifyAndProcessCallback(
     };
   }
 
-  // ── 8. Map provider status and apply transition ───────────────────────────
+  // ── 9. Map provider status and apply transition ───────────────────────────
+  // transitionPaymentStatus() is idempotent: a duplicate confirmation for an
+  // already-confirmed payment returns { replayed: true } without re-applying
+  // the state change, so payments are never double-recorded.
   const canonicalStatus = mapProviderStatus(body.status);
 
   const transitionResult = await transitionPaymentStatus(
